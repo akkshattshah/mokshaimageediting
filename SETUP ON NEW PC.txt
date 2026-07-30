@@ -1,0 +1,81 @@
+PHOTO HANDOUT - Setting up on a new computer
+============================================
+
+Do these steps once. After that, daily use is just double-clicking
+"Start Photo Handout" (see HOW TO USE.txt).
+
+
+STEP 1 - Install Python
+-----------------------
+ - Go to  https://www.python.org/downloads/  and download Python for Windows.
+ - IMPORTANT: on the first screen of the installer, TICK the box
+   "Add python.exe to PATH", then click Install.
+
+
+STEP 2 - Put this folder somewhere sensible
+-------------------------------------------
+ - Unzip the folder (e.g. onto the Desktop). Keep all the files together.
+
+
+STEP 3 - Install the components
+-------------------------------
+ - Double-click  "Setup (run once).bat"
+ - Wait for it to say "Setup complete", then close the window.
+
+
+STEP 4 - Add the photo-storage (S3) credentials
+-----------------------------------------------
+ The tool reads photos from the client's cloud storage and needs a key.
+ You should have been given an ACCESS KEY ID and a SECRET ACCESS KEY.
+
+ - Open File Explorer and go to:   C:\Users\<YOUR WINDOWS USERNAME>
+ - Create a new folder called:     .aws
+   (type the name as  .aws  - with the dot at the start)
+ - Inside it create a file called: credentials
+   (no file extension - not credentials.txt)
+ - Put exactly this inside, with your key pasted in:
+
+       [default]
+       aws_access_key_id = PASTE_THE_ACCESS_KEY_ID_HERE
+       aws_secret_access_key = PASTE_THE_SECRET_KEY_HERE
+       region = ap-south-1
+
+ - Save and close.
+
+
+STEP 5 - Connect Google Drive
+-----------------------------
+ The finished zips are uploaded to Google Drive and shared as links.
+
+ - Make sure the file  client_secret.json  is in this folder.
+ - Double-click  "Authorize Google Drive (run once).bat"
+ - Your browser opens: choose the Google account the zips should go to,
+   then click Allow. (If it warns the app isn't verified, click
+   Advanced > Go to ... (unsafe) > Allow. That's normal for an in-house tool.)
+ - It saves a file called token.json. You never have to do this again.
+
+
+STEP 6 - You're done
+--------------------
+ - Double-click "Start Photo Handout" and the tool opens in your browser.
+ - Read HOW TO USE.txt for the day-to-day steps.
+
+
+TROUBLESHOOTING
+---------------
+ "This site can't be reached" / connection refused
+     The tool isn't running. Double-click "Start Photo Handout" and keep
+     that black window open.
+
+ "ERR_NO_BUFFER_SPACE" or the page won't load even though it's running
+     Close and reopen your browser, then try again. If it persists,
+     restart the computer.
+
+ "Python was not found"
+     Python isn't installed, or "Add python.exe to PATH" wasn't ticked
+     during install. Reinstall Python with that box ticked.
+
+ Uploads seem very slow
+     That's your internet's upload speed, not the tool. Big batches can
+     take a long time. You can leave it running - each freelancer's link
+     appears on the page as soon as their upload finishes.

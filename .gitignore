@@ -1,0 +1,24 @@
+# --- secrets: NEVER commit these ---
+client_secret.json
+token.json
+.drive_folder.json
+.aws/
+*.env
+
+# --- local data / generated ---
+pool/
+zips/
+worker_pool/
+*.db
+*.sqlite
+*.log
+
+# --- python ---
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# --- os ---
+.DS_Store
+Thumbs.db

@@ -1,0 +1,105 @@
+"""Google Drive for the platform. The platform holds the Drive credentials; it
+hands out short-lived *upload* links so each worker's companion sends finished
+bytes straight to Google (the server never carries the files). Uses the same
+token.json / client_secret.json as the desktop tool.
+"""
+
+import os
+import json
+
+from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request, AuthorizedSession
+from googleapiclient.discovery import build
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(HERE)                 # project root (token.json lives here)
+SCOPES = ["https://www.googleapis.com/auth/drive.file"]
+FOLDER_NAME = os.environ.get("DRIVE_FOLDER", "PhotoHandout Uploads")
+RESUMABLE = "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable"
+
+_cache = {"folder_id": None}
+
+
+def _token_path():
+    return os.environ.get("GOOGLE_TOKEN_FILE", os.path.join(ROOT, "token.json"))
+
+
+def _source():
+    """Where the Google token comes from: an env var (Railway) or a file (local
+    dev). Returns (kind, value)."""
+    env = os.environ.get("GOOGLE_TOKEN_JSON")
+    if env:
+        return "env", json.loads(env)
+    path = _token_path()
+    if os.path.exists(path):
+        return "file", path
+    return None, None
+
+
+def drive_ready():
+    kind, _ = _source()
+    return kind is not None
+
+
+def _creds():
+    kind, src = _source()
+    if kind == "env":
+        creds = Credentials.from_authorized_user_info(src, SCOPES)
+    elif kind == "file":
+        creds = Credentials.from_authorized_user_file(src, SCOPES)
+    else:
+        raise RuntimeError("No Google credentials. Set GOOGLE_TOKEN_JSON "
+                           "(deployed) or provide token.json (local).")
+    if not creds.valid and creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+        if kind == "file":   # only a real file can be persisted
+            with open(src, "w", encoding="utf-8") as f:
+                f.write(creds.to_json())
+    return creds
+
+
+def _service(creds=None):
+    return build("drive", "v3", credentials=creds or _creds(),
+                 cache_discovery=False)
+
+
+def folder_id():
+    """Find-or-create the uploads folder, cached in memory."""
+    if _cache["folder_id"]:
+        return _cache["folder_id"]
+    svc = _service()
+    q = (f"mimeType='application/vnd.google-apps.folder' and trashed=false "
+         f"and name='{FOLDER_NAME}'")
+    files = svc.files().list(q=q, fields="files(id)").execute().get("files", [])
+    if files:
+        fid = files[0]["id"]
+    else:
+        fid = svc.files().create(
+            body={"name": FOLDER_NAME,
+                  "mimeType": "application/vnd.google-apps.folder"},
+            fields="id").execute()["id"]
+    _cache["folder_id"] = fid
+    return fid
+
+
+def init_upload_session(name, mimetype="application/octet-stream"):
+    """Start a resumable upload and return the session URL. The worker PUTs the
+    file bytes straight to this URL - no Drive credentials on their side."""
+    authed = AuthorizedSession(_creds())
+    meta = {"name": name, "parents": [folder_id()]}
+    r = authed.post(RESUMABLE, json=meta,
+                    headers={"X-Upload-Content-Type": mimetype})
+    r.raise_for_status()
+    return r.headers["Location"]
+
+
+def finalize(file_id):
+    """After the worker uploads, make it link-viewable and return the link."""
+    svc = _service()
+    try:
+        svc.permissions().create(
+            fileId=file_id, body={"type": "anyone", "role": "reader"}).execute()
+    except Exception:  # noqa
+        pass
+    f = svc.files().get(fileId=file_id, fields="id,webViewLink").execute()
+    return f.get("webViewLink") or f"https://drive.google.com/file/d/{file_id}/view"

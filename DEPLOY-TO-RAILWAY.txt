@@ -1,0 +1,98 @@
+DEPLOYING THE PLATFORM (hub) TO RAILWAY
+=======================================
+
+This deploys the multi-user platform (hub/) as its own Railway service.
+The desktop tool is not deployed - only the hub/ package.
+
+The server stays tiny: photo bytes never pass through it (workers download from
+S3 and upload to Drive directly). Railway only runs the coordinator + Postgres.
+
+
+------------------------------------------------------------------
+STEP 1 — Put the code in a private GitHub repo
+------------------------------------------------------------------
+From this folder (Git Bash or terminal):
+
+    git init
+    git add .
+    git commit -m "Photo Handout platform"
+
+  The .gitignore already excludes the secrets (client_secret.json, token.json,
+  pool/, *.db, etc.) - double-check `git status` does NOT list token.json or
+  client_secret.json before pushing.
+
+  Create a PRIVATE repo on github.com, then:
+
+    git remote add origin https://github.com/<you>/<repo>.git
+    git branch -M main
+    git push -u origin main
+
+
+------------------------------------------------------------------
+STEP 2 — Create the Railway project + database
+------------------------------------------------------------------
+  1. Railway → New Project → "Deploy from GitHub repo" → pick the repo.
+     (Use a NEW project, separate from vocalix/trilionclips.)
+  2. In that project → New → Database → "Add PostgreSQL". Railway sets the
+     DATABASE_URL variable automatically; you don't copy it anywhere.
+  3. Railway detects Python, installs requirements.txt, and runs the Procfile
+     (gunicorn hub.app:app). It creates the tables on first boot.
+
+
+------------------------------------------------------------------
+STEP 3 — Set the environment variables (Service → Variables)
+------------------------------------------------------------------
+  Add these (DATABASE_URL is already there from the Postgres plugin):
+
+    SECRET_KEY            = <any long random string>
+    ADMIN_LOGIN           = admin
+    ADMIN_PASSWORD        = <a strong password you choose>
+
+    AWS_ACCESS_KEY_ID     = <the S3 access key id>
+    AWS_SECRET_ACCESS_KEY = <the S3 secret key>
+    AWS_REGION            = ap-south-1
+    S3_BUCKET             = carcutter-mumbai
+
+    GOOGLE_TOKEN_JSON     = <paste the ENTIRE contents of token.json here,
+                            as one line - open token.json, copy everything>
+
+  (Optional) DRIVE_FOLDER = PhotoHandout Uploads
+
+
+------------------------------------------------------------------
+STEP 4 — Set a spend limit (so it can never surprise-bill)
+------------------------------------------------------------------
+  Project/Account → Usage → Set limits. Pick a ceiling you're comfortable with.
+
+
+------------------------------------------------------------------
+STEP 5 — Open it
+------------------------------------------------------------------
+  Service → Settings → Networking → Generate Domain. You get a URL like
+    https://photohandout-production.up.railway.app
+  Open it, sign in as admin (ADMIN_LOGIN / ADMIN_PASSWORD), add workers,
+  and assign work.
+
+
+------------------------------------------------------------------
+STEP 6 — Point the workers' companion at it
+------------------------------------------------------------------
+  Each worker runs the companion against the live URL:
+
+    python -m hub.companion download --hub https://<your-app>.up.railway.app --login yash --password ***
+    python -m hub.companion upload   --hub https://<your-app>.up.railway.app --login yash --password ***
+
+  (The companion needs Python + the hub package + requirements installed on the
+  worker's PC. Packaging it into a one-click app is a follow-up, like the
+  desktop launcher.)
+
+
+------------------------------------------------------------------
+NOTES
+------------------------------------------------------------------
+ - Redeploys wipe Railway's local disk, but nothing important lives there:
+   all state is in Postgres, and Google creds come from GOOGLE_TOKEN_JSON.
+ - To rotate the admin password later, change ADMIN_PASSWORD only affects the
+   FIRST seed; after that, manage accounts from the admin screen.
+ - If Drive stops working, the token was likely revoked - regenerate token.json
+   locally (python drive_auth.py) and update GOOGLE_TOKEN_JSON.

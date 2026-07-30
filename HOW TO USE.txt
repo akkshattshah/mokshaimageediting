@@ -1,0 +1,37 @@
+PHOTO HANDOUT - How to use
+==========================
+
+Everyday use (2 steps):
+
+1) DOWNLOAD photos into the pool
+   - Double-click "Download Photos".
+   - Type the brand name and how many photos, press Enter.
+   - Wait for it to finish, then close the window.
+
+2) HAND OUT photos to freelancers
+   - Double-click "Start Photo Handout".
+   - A browser tab opens by itself. (Keep the little black window open -
+     that is the program running. Closing it stops the tool.)
+   - Pick the brand, type each freelancer's name and how many photos.
+   - Click "Preview" to check, or "Create & Upload" to send.
+   - The page shows a Google Drive link for each freelancer as it finishes.
+     Copy the link and send it to that freelancer.
+   - Click "View handout history" any time to see who got what, when,
+     with their Drive link.
+
+Good to know:
+ - A "photo" = the image plus its PSD, counted as 1.
+ - Once photos are handed out they are removed from this computer
+   automatically (they live in Google Drive) - so nothing piles up here.
+ - The same photo is never given out twice, and downloads never re-fetch
+   photos that were already handed out.
+ - Uploads to Google Drive can take a while for big batches - that's your
+   internet's upload speed, not the tool. You can leave it running; links
+   appear on the page as each freelancer's upload finishes.
+
+First time on a NEW computer (one-time setup):
+ - Install Python from python.org (tick "Add python.exe to PATH").
+ - Double-click "Setup (run once)".
+ - Make sure these are in this folder / set up: the AWS credentials,
+   client_secret.json and token.json (Google Drive sign-in).
+ - After that, just use the two steps above.
