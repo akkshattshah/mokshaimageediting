@@ -127,8 +127,14 @@ ADMIN = STYLE + """
             {% for w in workers %}<option value="{{w.login}}">{{w.name}} ({{w.login}})</option>{% endfor %}
           </select></div>
         <div><label>Brand</label>
-          <input name="brand" list="brands" placeholder="catchall_ireland" required>
-          <datalist id="brands">{% for b in brands %}<option value="{{b}}">{% endfor %}</datalist></div>
+          {% if brands %}
+          <select name="brand" required>
+            <option value="" disabled selected>Choose a brand…</option>
+            {% for b in brands %}<option value="{{b}}">{{b}}</option>{% endfor %}
+          </select>
+          {% else %}
+          <input name="brand" placeholder="catchall_ireland" required>
+          {% endif %}</div>
         <div style="max-width:110px"><label>Photos</label>
           <input name="count" type="number" min="1" placeholder="60" required></div>
         <div style="max-width:120px;flex:0"><button type="submit">Assign</button></div>
