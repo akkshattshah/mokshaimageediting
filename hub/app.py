@@ -150,6 +150,18 @@ ADMIN = STYLE + """
   </div>
 
   <div class="card">
+    <h2>QC summary</h2>
+    <div style="display:flex;gap:36px;flex-wrap:wrap;margin-top:6px">
+      <div><div class="muted" style="font-size:12px">Properly done</div>
+        <div class="num" style="font-size:26px;font-weight:700;color:var(--good)">{{totals.done}}</div></div>
+      <div><div class="muted" style="font-size:12px">Rectified by QC</div>
+        <div class="num" style="font-size:26px;font-weight:700;color:var(--accent)">{{totals.rectified}}</div></div>
+      <div><div class="muted" style="font-size:12px">Rejected</div>
+        <div class="num" style="font-size:26px;font-weight:700;color:#c5423c">{{totals.rejected}}</div></div>
+    </div>
+  </div>
+
+  <div class="card">
     <h2>Timeline</h2>
     {% if not rows %}<p class="muted">No assignments yet.</p>{% else %}
     <div class="legend">
@@ -158,7 +170,7 @@ ADMIN = STYLE + """
       <span><i style="background:var(--warn)"></i>retouching</span>
       <span><i style="background:var(--line)"></i>to download</span></div>
     <table>
-      <tr><th>Assigned</th><th>Uploaded</th><th>Worker</th><th>QC</th><th>Brand</th><th>Progress</th><th>Left</th><th></th></tr>
+      <tr><th>Assigned</th><th>Uploaded</th><th>Worker</th><th>QC</th><th>Brand</th><th>Step 1 · Retouch</th><th>Left</th><th>Step 2 · QC</th><th></th></tr>
       {% for r in rows %}
       <tr>
         <td class="muted num" style="white-space:nowrap">{{r.when}}</td>
@@ -179,6 +191,11 @@ ADMIN = STYLE + """
           <span class="num muted">{{r.uploaded}}/{{r.assigned}}</span></div></td>
         <td>{% if r.remaining==0 and r.assigned>0 %}<span class="pill done">done</span>
             {% else %}<span class="pill rem">{{r.remaining}}</span>{% endif %}</td>
+        <td>{% if r.stage=='worker' %}<span class="muted" style="font-size:12px">waiting</span>
+            {% elif r.stage=='complete' %}<span class="pill done">✓ QC done</span>
+            {% else %}<span class="pill" style="background:var(--warn-bg);color:var(--warn)">QC {{r.qc_done}}/{{r.assigned}}</span>{% endif %}
+            {% if r.qc_rejected %}<div style="font-size:11px;color:#c5423c">{{r.qc_rejected}} rejected</div>{% endif %}
+            {% if r.qc_pending %}<div style="font-size:11px" class="muted">{{r.qc_pending}} to review</div>{% endif %}</td>
         <td><a href="{{url_for('assignment_view', aid=r.assignment_id)}}">details</a></td>
       </tr>
       {% endfor %}
@@ -252,6 +269,23 @@ WORKER = STYLE + """
     <p class="muted" style="font-size:12px;margin-top:14px">Download the zip, retouch, then <b>Upload finished</b> and pick your finished files. Each finished file is matched to its photo by name — anything you still owe stays under “left”, and your admin sees the same.</p>
     {% endif %}
   </div>
+
+  {% set nrej = summary.assignments | map(attribute='rejected') | sum %}
+  {% if nrej %}
+  <div class="card">
+    <h2 style="color:#c5423c">Sent back by QC — please redo ({{nrej}})</h2>
+    {% for a in summary.assignments %}{% for r in a.rejected_list %}
+    <div style="display:flex;gap:14px;padding:12px 0;border-top:1px solid var(--line);align-items:flex-start">
+      {% if r.shot_thumb %}<a href="{{r.shot}}" target="_blank"><img src="{{r.shot_thumb}}" style="width:96px;height:66px;object-fit:cover;border-radius:6px;border:1px solid var(--line)" onerror="this.style.display='none'"></a>{% endif %}
+      <div>
+        <div><b>{{a.brand}}</b> · <span class="num muted" style="font-size:12px">{{r.name}}</span></div>
+        <div style="margin-top:2px"><b>Issue:</b> {{ r.remark or '(no note left)' }}</div>
+        <div class="muted" style="font-size:12px;margin-top:2px">Redo this photo, then upload the finished file again — it goes back to QC.</div>
+      </div>
+    </div>
+    {% endfor %}{% endfor %}
+  </div>
+  {% endif %}
 </div>
 <style>.dlbtn,.upbtn{display:inline-block;padding:7px 14px;border-radius:8px;font-size:13px;border:0;cursor:pointer}
 .dlbtn{background:var(--accent);color:#fff;text-decoration:none}
@@ -347,8 +381,9 @@ QC_DETAIL = STYLE + """
   <a href="{{url_for('qc')}}">← back to my list</a>
   <div class="card">
     <h1>{{d.worker}} · {{d.brand}}</h1>
-    <p class="muted" style="margin-top:0">{{d.photos|length}} photos · assigned {{d.when}}.
-       Click any image to open it full-size in Drive.</p>
+    <p class="muted" style="margin-top:0">{{d.photos|length}} photos. Mark each <b>Okay</b> or
+       <b>Reject</b> (add a note + screenshot of the issue), or upload a quick <b>Fix</b> yourself.
+       Click an image to open it full-size.</p>
     <div class="qgrid">
       {% for p in d.photos %}
       <div class="qtile">
@@ -359,10 +394,32 @@ QC_DETAIL = STYLE + """
           <div class="qph">{{ 'not uploaded yet' if p.status != 'uploaded' else 'no preview' }}</div>
         {% endif %}
         <div class="qcap">
-          {% if p.status=='uploaded' %}<span class="pill done">done</span>
-          {% elif p.status=='downloaded' %}<span class="pill rem">retouching</span>
-          {% else %}<span class="muted" style="font-size:12px">to download</span>{% endif %}
-          {% if p.link %}<a href="{{p.link}}" target="_blank" style="float:right;font-size:12px">open ↗</a>{% endif %}
+          {% if p.qc=='ok' %}
+            <span class="pill done">✓ okay</span>
+          {% elif p.qc=='rectified' %}
+            <span class="pill" style="background:var(--good-bg);color:var(--good)">rectified by QC</span>
+            {% if p.link %}<a href="{{p.link}}" target="_blank" style="float:right;font-size:12px">view ↗</a>{% endif %}
+          {% elif p.qc=='reject' %}
+            <span class="pill rem">rejected → sent back</span>
+            {% if p.qc_remark %}<div class="muted" style="font-size:12px;margin-top:4px">“{{p.qc_remark}}”</div>{% endif %}
+          {% elif p.status=='uploaded' %}
+            <div style="display:flex;gap:5px;flex-wrap:wrap">
+              <form method="post" action="{{url_for('qc_photo_ok', pid=p.id)}}" style="margin:0"><button class="okb">Okay</button></form>
+              <button class="rjb" onclick="tgl('r{{p.id}}')">Reject</button>
+              <button class="fxb" onclick="tgl('f{{p.id}}')">Fix</button>
+            </div>
+            <form id="r{{p.id}}" class="hid" method="post" enctype="multipart/form-data" action="{{url_for('qc_photo_reject', pid=p.id)}}">
+              <textarea name="remark" placeholder="what's the issue?" rows="2"></textarea>
+              <label class="flab">screenshot (optional)<input type="file" name="shot" accept="image/*"></label>
+              <button class="rjb" style="width:100%">Send back to worker</button>
+            </form>
+            <form id="f{{p.id}}" class="hid" method="post" enctype="multipart/form-data" action="{{url_for('qc_photo_rectify', pid=p.id)}}">
+              <label class="flab">upload your fixed image<input type="file" name="file" accept="image/*" required></label>
+              <button class="fxb" style="width:100%">Upload my fix</button>
+            </form>
+          {% else %}
+            <span class="muted" style="font-size:12px">worker hasn't uploaded yet</span>
+          {% endif %}
         </div>
       </div>
       {% endfor %}
@@ -370,13 +427,20 @@ QC_DETAIL = STYLE + """
   </div>
 </div>
 <style>
-  .qgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:14px;margin-top:16px}
+  .qgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:14px;margin-top:16px}
   .qtile{border:1px solid var(--line);border-radius:10px;overflow:hidden;background:var(--card)}
-  .qtile img{width:100%;height:160px;object-fit:cover;display:block;background:var(--line)}
-  .qph{height:160px;display:grid;place-items:center;text-align:center;color:var(--muted);
-       font-size:12px;padding:0 10px;background:var(--card)}
-  .qcap{padding:8px 10px}
+  .qtile img{width:100%;height:160px;object-fit:cover;display:block;background:var(--line);cursor:zoom-in}
+  .qph{height:160px;display:grid;place-items:center;text-align:center;color:var(--muted);font-size:12px;padding:0 10px;background:var(--card)}
+  .qcap{padding:9px 10px}
+  .okb{background:var(--good);color:#fff;border:0;border-radius:6px;padding:5px 11px;font-size:12px;cursor:pointer}
+  .rjb{background:#c5423c;color:#fff;border:0;border-radius:6px;padding:5px 11px;font-size:12px;cursor:pointer}
+  .fxb{background:var(--accent);color:#fff;border:0;border-radius:6px;padding:5px 11px;font-size:12px;cursor:pointer}
+  .hid{display:none;margin-top:8px}
+  .qcap textarea{width:100%;font-size:12px;padding:6px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--ink)}
+  .flab{display:block;font-size:11px;color:var(--muted);margin:6px 0}
+  .flab input{display:block;font-size:11px;margin-top:2px}
 </style>
+<script>function tgl(id){var e=document.getElementById(id);e.style.display=e.style.display==='block'?'none':'block';}</script>
 """
 
 
@@ -422,6 +486,7 @@ def admin():
     return render_template_string(
         ADMIN, name=session.get("name"),
         rows=engine.admin_overview(),
+        totals=engine.totals(),
         workers=auth.list_workers(role="worker"),
         qcs=auth.list_workers(role="qc"),
         workers_all=everyone,
@@ -507,6 +572,49 @@ def qc_assignment_view(aid):
     if not d or d.get("qc_login") != session.get("login"):
         abort(403)          # a QC can only open batches assigned to them
     return render_template_string(QC_DETAIL, name=session.get("name"), d=d)
+
+
+@app.route("/qc/photo/<int:pid>/ok", methods=["POST"])
+@login_required
+def qc_photo_ok(pid):
+    if session.get("role") != ROLE_QC:
+        abort(403)
+    aid = engine.qc_mark_ok(pid, session.get("login"))
+    if aid is None:
+        abort(403)
+    return redirect(url_for("qc_assignment_view", aid=aid))
+
+
+@app.route("/qc/photo/<int:pid>/reject", methods=["POST"])
+@login_required
+def qc_photo_reject(pid):
+    if session.get("role") != ROLE_QC:
+        abort(403)
+    if engine.photo_qc_login(pid) != session.get("login"):
+        abort(403)
+    remark = request.form.get("remark", "").strip()
+    shot_link = ""
+    f = request.files.get("shot")
+    if f and f.filename:
+        _, shot_link = drive.upload_file("QC_" + f.filename, f.mimetype,
+                                         io.BytesIO(f.read()))
+    aid = engine.qc_mark_reject(pid, session.get("login"), remark, shot_link)
+    return redirect(url_for("qc_assignment_view", aid=aid or 0))
+
+
+@app.route("/qc/photo/<int:pid>/rectify", methods=["POST"])
+@login_required
+def qc_photo_rectify(pid):
+    if session.get("role") != ROLE_QC:
+        abort(403)
+    if engine.photo_qc_login(pid) != session.get("login"):
+        abort(403)
+    f = request.files.get("file")
+    if not f or not f.filename:
+        abort(400)
+    _, link = drive.upload_file(f.filename, f.mimetype, io.BytesIO(f.read()))
+    aid = engine.qc_mark_rectify(pid, session.get("login"), link)
+    return redirect(url_for("qc_assignment_view", aid=aid or 0))
 
 
 @app.route("/me")

@@ -18,10 +18,16 @@ ROLE_ADMIN = "admin"
 ROLE_WORKER = "worker"
 ROLE_QC = "qc"
 
-# lifecycle of a single assigned photo
+# lifecycle of a single assigned photo (the worker pipeline)
 ST_ASSIGNED = "assigned"       # reserved for the worker, not yet pulled
-ST_DOWNLOADED = "downloaded"   # worker fetched it from S3
-ST_UPLOADED = "uploaded"       # finished file came back to Drive -> done
+ST_DOWNLOADED = "downloaded"   # worker fetched it from S3 (also where a rejected
+                               # photo returns to, for redo)
+ST_UPLOADED = "uploaded"       # finished file came back to Drive
+
+# the QC verdict layered on top of an uploaded photo
+QC_OK = "ok"                   # approved as-is
+QC_REJECT = "reject"           # sent back to the worker to redo
+QC_RECTIFIED = "rectified"     # QC fixed it themselves and re-uploaded
 
 
 class Worker(Base):
@@ -71,5 +77,11 @@ class AssignmentPhoto(Base):
     drive_link: Mapped[str] = mapped_column(Text, default="")
     uploaded_at: Mapped[dt.datetime | None] = mapped_column(
         DateTime, nullable=True)
+
+    # QC layer
+    qc: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    qc_remark: Mapped[str] = mapped_column(Text, default="")
+    qc_shot: Mapped[str] = mapped_column(Text, default="")   # screenshot link
+    qc_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
 
     assignment: Mapped["Assignment"] = relationship(back_populates="photos")

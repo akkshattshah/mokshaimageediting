@@ -13,7 +13,8 @@ from sqlalchemy import select, func
 
 from .db import SessionLocal
 from .models import (Worker, Assignment, AssignmentPhoto,
-                     ST_ASSIGNED, ST_DOWNLOADED, ST_UPLOADED, ROLE_WORKER)
+                     ST_ASSIGNED, ST_DOWNLOADED, ST_UPLOADED, ROLE_WORKER,
+                     QC_OK, QC_REJECT, QC_RECTIFIED)
 from . import s3source
 
 
@@ -98,6 +99,10 @@ def _flip(session, assignment_id, photo_ids, new_status, drive_links=None):
             r.uploaded_at = dt.datetime.utcnow()
             if drive_links:
                 r.drive_link = drive_links.get(r.photo_id, r.drive_link)
+            # a (re)upload clears any prior QC verdict so it re-enters review
+            r.qc = None
+            r.qc_remark = ""
+            r.qc_shot = ""
         changed += 1
     return changed
 
@@ -152,6 +157,11 @@ def assignment_progress(assignment_id):
             "remaining_ids": [p.photo_id for p in photos
                               if p.status != ST_UPLOADED],
             "complete": c[ST_UPLOADED] == len(photos) and len(photos) > 0,
+            "rejected": sum(1 for p in photos if p.qc == QC_REJECT),
+            "rejected_list": [
+                {"name": p.photo_id.split("/")[-1], "remark": p.qc_remark or "",
+                 "shot": p.qc_shot or "", "shot_thumb": _drive_thumb(p.qc_shot)}
+                for p in photos if p.qc == QC_REJECT],
         }
 
 
@@ -174,10 +184,104 @@ def assignment_detail(assignment_id):
             "qc": a.qc.name if a.qc else None,
             "qc_login": a.qc.login if a.qc else None,
             "when": a.created_at.strftime("%Y-%m-%d %H:%M"),
-            "photos": [{"name": p.photo_id.split("/")[-1], "status": p.status,
-                        "link": p.drive_link, "thumb": _drive_thumb(p.drive_link)}
+            "photos": [{"id": p.id, "name": p.photo_id.split("/")[-1],
+                        "status": p.status, "link": p.drive_link,
+                        "thumb": _drive_thumb(p.drive_link),
+                        "qc": p.qc, "qc_remark": p.qc_remark or "",
+                        "qc_shot": p.qc_shot or "",
+                        "shot_thumb": _drive_thumb(p.qc_shot)}
                        for p in a.photos],
         }
+
+
+# ---- QC verdicts ---------------------------------------------------------
+def _qc_photo(s, photo_row_id, qc_login):
+    """Fetch a photo only if the given QC is the one assigned to its batch."""
+    p = s.get(AssignmentPhoto, photo_row_id)
+    if not p:
+        return None
+    a = p.assignment
+    if not a.qc or a.qc.login != qc_login.strip().lower():
+        return None
+    return p
+
+
+def photo_qc_login(photo_row_id):
+    """The login of the QC assigned to a photo's batch (or None)."""
+    with SessionLocal() as s:
+        p = s.get(AssignmentPhoto, photo_row_id)
+        return p.assignment.qc.login if (p and p.assignment.qc) else None
+
+
+def qc_mark_ok(photo_row_id, qc_login):
+    with SessionLocal() as s:
+        p = _qc_photo(s, photo_row_id, qc_login)
+        if not p:
+            return None
+        p.qc = QC_OK
+        p.qc_remark = p.qc_shot = ""
+        p.qc_at = dt.datetime.utcnow()
+        aid = p.assignment_id
+        s.commit()
+        return aid
+
+
+def qc_mark_reject(photo_row_id, qc_login, remark, shot_link=""):
+    """Reject: record feedback and send the photo back to the worker to redo."""
+    with SessionLocal() as s:
+        p = _qc_photo(s, photo_row_id, qc_login)
+        if not p:
+            return None
+        p.qc = QC_REJECT
+        p.qc_remark = remark or ""
+        p.qc_shot = shot_link or ""
+        p.qc_at = dt.datetime.utcnow()
+        p.status = ST_DOWNLOADED     # back into the worker's "to redo" list
+        aid = p.assignment_id
+        s.commit()
+        return aid
+
+
+def qc_mark_rectify(photo_row_id, qc_login, new_link):
+    """QC fixed it themselves: replace the file and mark rectified (final)."""
+    with SessionLocal() as s:
+        p = _qc_photo(s, photo_row_id, qc_login)
+        if not p:
+            return None
+        p.qc = QC_RECTIFIED
+        p.drive_link = new_link
+        p.qc_remark = p.qc_shot = ""
+        p.qc_at = dt.datetime.utcnow()
+        aid = p.assignment_id
+        s.commit()
+        return aid
+
+
+def _qc_counts(photos):
+    """QC breakdown for a set of photos."""
+    ok = sum(1 for p in photos if p.qc == QC_OK)
+    rect = sum(1 for p in photos if p.qc == QC_RECTIFIED)
+    rej = sum(1 for p in photos if p.qc == QC_REJECT)
+    pending = sum(1 for p in photos
+                  if p.status == ST_UPLOADED and p.qc is None)
+    return {"ok": ok, "rectified": rect, "rejected": rej, "pending": pending}
+
+
+def _stage(photos):
+    """Which of the two steps a batch is at, for the admin."""
+    total = len(photos)
+    if total == 0:
+        return "empty"
+    q = _qc_counts(photos)
+    done = q["ok"] + q["rectified"]
+    if done == total:
+        return "complete"                      # step 2 finished
+    uploaded = sum(1 for p in photos if p.status == ST_UPLOADED)
+    if uploaded == total and q["pending"] == 0 and q["rejected"] == 0:
+        return "complete"
+    if uploaded == total or q["pending"] or q["rejected"] or done:
+        return "qc"                            # worker done, QC underway
+    return "worker"                            # step 1 still in progress
 
 
 def worker_summary(worker_login):
@@ -262,6 +366,7 @@ def admin_overview():
         for a in s.scalars(select(Assignment).order_by(Assignment.created_at.desc())):
             c = _breakdown(a.photos)
             total = len(a.photos)
+            qc = _qc_counts(a.photos)
             rows.append({
                 "assignment_id": a.id, "worker": a.worker.name,
                 "qc": a.qc.name if a.qc else None,
@@ -271,8 +376,22 @@ def admin_overview():
                 "remaining": total - c[ST_UPLOADED],
                 "when": a.created_at.strftime("%Y-%m-%d %H:%M"),
                 "uploaded_when": _last_upload(a.photos),
+                "qc_ok": qc["ok"], "qc_rectified": qc["rectified"],
+                "qc_rejected": qc["rejected"], "qc_pending": qc["pending"],
+                "qc_done": qc["ok"] + qc["rectified"], "stage": _stage(a.photos),
             })
         return rows
+
+
+def totals():
+    """Overall QC metrics across every assignment, for the admin summary."""
+    with SessionLocal() as s:
+        photos = s.query(AssignmentPhoto).all()
+        return {
+            "done": sum(1 for p in photos if p.qc == QC_OK),
+            "rectified": sum(1 for p in photos if p.qc == QC_RECTIFIED),
+            "rejected": sum(1 for p in photos if p.qc == QC_REJECT),
+        }
 
 
 def qc_assignments(qc_login):
@@ -288,6 +407,7 @@ def qc_assignments(qc_login):
         for a in s.scalars(q):
             c = _breakdown(a.photos)
             total = len(a.photos)
+            qc = _qc_counts(a.photos)
             rows.append({
                 "assignment_id": a.id, "worker": a.worker.name,
                 "brand": a.brand, "assigned": total,
@@ -297,5 +417,8 @@ def qc_assignments(qc_login):
                 "complete": c[ST_UPLOADED] == total and total > 0,
                 "when": a.created_at.strftime("%Y-%m-%d %H:%M"),
                 "uploaded_when": _last_upload(a.photos),
+                "qc_pending": qc["pending"], "qc_ok": qc["ok"],
+                "qc_rectified": qc["rectified"], "qc_rejected": qc["rejected"],
+                "qc_done": qc["ok"] + qc["rectified"],
             })
         return rows

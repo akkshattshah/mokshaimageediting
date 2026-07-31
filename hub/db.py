@@ -21,16 +21,27 @@ class Base(DeclarativeBase):
 
 
 def _add_missing_columns():
-    """Lightweight migration: add columns that were introduced after a table
-    already existed in production (create_all only creates missing TABLES, not
-    missing COLUMNS). Safe to run every startup."""
+    """Lightweight migration: add columns introduced after a table already
+    existed in production (create_all only creates missing TABLES, not missing
+    COLUMNS). Safe to run every startup."""
     insp = inspect(engine)
-    if "assignments" not in insp.get_table_names():
-        return
-    cols = {c["name"] for c in insp.get_columns("assignments")}
-    if "qc_id" not in cols:
-        with engine.begin() as conn:
-            conn.execute(text("ALTER TABLE assignments ADD COLUMN qc_id INTEGER"))
+    tables = set(insp.get_table_names())
+    wanted = {
+        "assignments": {"qc_id": "INTEGER"},
+        "assignment_photos": {
+            "qc": "TEXT", "qc_remark": "TEXT", "qc_shot": "TEXT",
+            "qc_at": "TIMESTAMP",
+        },
+    }
+    for table, cols in wanted.items():
+        if table not in tables:
+            continue
+        existing = {c["name"] for c in insp.get_columns(table)}
+        for col, coltype in cols.items():
+            if col not in existing:
+                with engine.begin() as conn:
+                    conn.execute(text(
+                        f"ALTER TABLE {table} ADD COLUMN {col} {coltype}"))
 
 
 def init_db():
