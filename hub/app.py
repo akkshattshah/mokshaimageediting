@@ -166,8 +166,8 @@ ADMIN = STYLE + """
         <td><b>{{r.worker}}</b></td>
         <td><form method="post" action="{{url_for('assign_qc_route')}}" style="margin:0">
               <input type="hidden" name="assignment_id" value="{{r.assignment_id}}">
-              <select name="qc" onchange="this.form.submit()" style="padding:5px 8px;font-size:12px;max-width:130px">
-                <option value="">— assign QC —</option>
+              <select name="qc" onchange="this.form.submit()" style="padding:5px 8px;font-size:12px;max-width:140px">
+                <option value="">{{ '— remove QC —' if r.qc else '— assign QC —' }}</option>
                 {% for q in qcs %}<option value="{{q.login}}" {{'selected' if q.name==r.qc else ''}}>{{q.name}}</option>{% endfor %}
               </select></form></td>
         <td>{{r.brand}}</td>
@@ -316,7 +316,7 @@ QC = STYLE + """
       <span><i style="background:var(--warn)"></i>retouching</span>
       <span><i style="background:var(--line)"></i>to download</span></div>
     <table>
-      <tr><th>Assigned</th><th>Uploaded</th><th>Worker</th><th>Brand</th><th>Progress</th><th>Status</th></tr>
+      <tr><th>Assigned</th><th>Uploaded</th><th>Worker</th><th>Brand</th><th>Progress</th><th>Status</th><th></th></tr>
       {% for r in rows %}
       <tr>
         <td class="muted num" style="white-space:nowrap">{{r.when}}</td>
@@ -330,13 +330,53 @@ QC = STYLE + """
           </div><span class="num muted">{{r.uploaded}}/{{r.assigned}}</span></div></td>
         <td>{% if r.complete %}<span class="pill done">ready to check</span>
             {% else %}<span class="pill rem">{{r.remaining}} pending</span>{% endif %}</td>
+        <td><a class="dlbtn" style="background:var(--accent);color:#fff;padding:6px 12px;border-radius:8px;text-decoration:none;font-size:13px" href="{{url_for('qc_assignment_view', aid=r.assignment_id)}}">Details check</a></td>
       </tr>
       {% endfor %}
     </table>
-    <p class="muted" style="font-size:12px;margin-top:14px">“Ready to check” means the worker has uploaded everything. Review actions (approve / reject) come next.</p>
+    <p class="muted" style="font-size:12px;margin-top:14px">“Ready to check” means the worker has uploaded everything. Click <b>Details check</b> to view the images.</p>
     {% endif %}
   </div>
 </div>
+"""
+
+QC_DETAIL = STYLE + """
+<div class="top"><b>Photo Handout · QC review</b>
+  <span><span class="who">{{name}}</span><a href="{{url_for('logout')}}">Sign out</a></span></div>
+<div class="wrap">
+  <a href="{{url_for('qc')}}">← back to my list</a>
+  <div class="card">
+    <h1>{{d.worker}} · {{d.brand}}</h1>
+    <p class="muted" style="margin-top:0">{{d.photos|length}} photos · assigned {{d.when}}.
+       Click any image to open it full-size in Drive.</p>
+    <div class="qgrid">
+      {% for p in d.photos %}
+      <div class="qtile">
+        {% if p.thumb %}
+          <a href="{{p.link}}" target="_blank"><img src="{{p.thumb}}" loading="lazy"
+             onerror="this.parentNode.innerHTML='<div class=&quot;qph&quot;>preview unavailable — open in Drive</div>'"></a>
+        {% else %}
+          <div class="qph">{{ 'not uploaded yet' if p.status != 'uploaded' else 'no preview' }}</div>
+        {% endif %}
+        <div class="qcap">
+          {% if p.status=='uploaded' %}<span class="pill done">done</span>
+          {% elif p.status=='downloaded' %}<span class="pill rem">retouching</span>
+          {% else %}<span class="muted" style="font-size:12px">to download</span>{% endif %}
+          {% if p.link %}<a href="{{p.link}}" target="_blank" style="float:right;font-size:12px">open ↗</a>{% endif %}
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+</div>
+<style>
+  .qgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:14px;margin-top:16px}
+  .qtile{border:1px solid var(--line);border-radius:10px;overflow:hidden;background:var(--card)}
+  .qtile img{width:100%;height:160px;object-fit:cover;display:block;background:var(--line)}
+  .qph{height:160px;display:grid;place-items:center;text-align:center;color:var(--muted);
+       font-size:12px;padding:0 10px;background:var(--card)}
+  .qcap{padding:8px 10px}
+</style>
 """
 
 
@@ -456,6 +496,17 @@ def qc():
         return redirect(url_for("home"))
     return render_template_string(QC, name=session.get("name"),
                                   rows=engine.qc_assignments(session.get("login")))
+
+
+@app.route("/qc/assignment/<int:aid>")
+@login_required
+def qc_assignment_view(aid):
+    if session.get("role") != ROLE_QC:
+        return redirect(url_for("home"))
+    d = engine.assignment_detail(aid)
+    if not d or d.get("qc_login") != session.get("login"):
+        abort(403)          # a QC can only open batches assigned to them
+    return render_template_string(QC_DETAIL, name=session.get("name"), d=d)
 
 
 @app.route("/me")

@@ -7,6 +7,7 @@
 """
 
 import datetime as dt
+import re
 
 from sqlalchemy import select, func
 
@@ -154,6 +155,15 @@ def assignment_progress(assignment_id):
         }
 
 
+def _drive_thumb(link):
+    """Turn a Drive share link into an inline thumbnail URL so images can be
+    previewed on the page."""
+    if not link:
+        return None
+    m = re.search(r"/d/([^/]+)", link)
+    return f"https://drive.google.com/thumbnail?id={m.group(1)}&sz=w600" if m else None
+
+
 def assignment_detail(assignment_id):
     with SessionLocal() as s:
         a = s.get(Assignment, assignment_id)
@@ -161,9 +171,12 @@ def assignment_detail(assignment_id):
             return None
         return {
             "assignment_id": a.id, "worker": a.worker.name, "brand": a.brand,
+            "qc": a.qc.name if a.qc else None,
+            "qc_login": a.qc.login if a.qc else None,
             "when": a.created_at.strftime("%Y-%m-%d %H:%M"),
             "photos": [{"name": p.photo_id.split("/")[-1], "status": p.status,
-                        "link": p.drive_link} for p in a.photos],
+                        "link": p.drive_link, "thumb": _drive_thumb(p.drive_link)}
+                       for p in a.photos],
         }
 
 
