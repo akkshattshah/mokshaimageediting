@@ -66,11 +66,12 @@ STYLE = """
   *{box-sizing:border-box}
   body{font-family:system-ui,'Segoe UI',Arial,sans-serif;background:var(--bg);color:var(--ink);
     margin:0;line-height:1.55}
-  .top{background:var(--card);border-bottom:1px solid var(--line);padding:14px 22px;
+  .top{background:var(--card);border-bottom:1px solid var(--line);padding:16px 40px;
     display:flex;justify-content:space-between;align-items:center}
   .top b{font-size:16px} .top .who{color:var(--muted);font-size:14px}
   .top a{color:var(--accent);text-decoration:none;font-size:14px;margin-left:14px}
-  .wrap{max-width:820px;margin:26px auto;padding:0 18px}
+  .wrap{max-width:1400px;margin:26px auto;padding:0 40px}
+  @media(max-width:640px){.top{padding:14px 18px}.wrap{padding:0 18px}}
   h1{font-size:20px;margin:0 0 4px} h2{font-size:15px;margin:0 0 10px}
   .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:20px;margin:16px 0}
   label{font-size:13px;color:var(--muted);display:block;margin-bottom:3px}
@@ -120,7 +121,7 @@ ADMIN = STYLE + """
 
   <div class="card">
     <h2>Assign work</h2>
-    <form method="post" action="{{url_for('assign')}}">
+    <form method="post" action="{{url_for('assign')}}" style="max-width:780px">
       <div class="row">
         <div><label>Worker</label>
           <select name="worker" required>
@@ -178,7 +179,7 @@ ADMIN = STYLE + """
       <tr><th>Name</th><th>Login</th><th>Role</th></tr>
       {% for w in workers_all %}<tr><td>{{w.name}}</td><td class="muted">{{w.login}}</td><td>{{w.role}}</td></tr>{% endfor %}
     </table>
-    <form method="post" action="{{url_for('add_worker')}}" style="margin-top:16px">
+    <form method="post" action="{{url_for('add_worker')}}" style="margin-top:16px;max-width:780px">
       <div class="row">
         <div><label>Name</label><input name="name" placeholder="Yash" required></div>
         <div><label>Login</label><input name="login" placeholder="yash" required></div>
