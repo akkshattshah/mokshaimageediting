@@ -174,17 +174,24 @@ ADMIN = STYLE + """
   </div>
 
   <div class="card">
-    <h2>Workers</h2>
+    <h2>Team</h2>
+    <div class="muted" style="font-size:13px;margin-bottom:10px">
+      {{n_workers}} worker{{ 's' if n_workers != 1 else '' }} · {{n_qc}} QC</div>
     <table>
       <tr><th>Name</th><th>Login</th><th>Role</th></tr>
-      {% for w in workers_all %}<tr><td>{{w.name}}</td><td class="muted">{{w.login}}</td><td>{{w.role}}</td></tr>{% endfor %}
+      {% for w in workers_all %}<tr><td>{{w.name}}</td><td class="muted">{{w.login}}</td>
+        <td>{% if w.role=='qc' %}<span class="pill" style="background:var(--warn-bg);color:var(--warn)">QC</span>
+            {% elif w.role=='admin' %}<span class="muted">admin</span>
+            {% else %}<span class="pill" style="background:var(--good-bg);color:var(--good)">worker</span>{% endif %}</td></tr>{% endfor %}
     </table>
-    <form method="post" action="{{url_for('add_worker')}}" style="margin-top:16px;max-width:780px">
+    <form method="post" action="{{url_for('add_worker')}}" style="margin-top:16px;max-width:900px">
       <div class="row">
         <div><label>Name</label><input name="name" placeholder="Yash" required></div>
         <div><label>Login</label><input name="login" placeholder="yash" required></div>
         <div><label>Password</label><input name="password" required></div>
-        <div style="max-width:130px;flex:0"><button type="submit">Add worker</button></div>
+        <div style="max-width:130px"><label>Role</label>
+          <select name="role"><option value="worker">Worker</option><option value="qc">QC</option></select></div>
+        <div style="max-width:100px;flex:0"><button type="submit">Add</button></div>
       </div>
     </form>
   </div>
@@ -319,11 +326,14 @@ def logout():
 @app.route("/admin")
 @admin_required
 def admin():
+    everyone = auth.list_workers()
     return render_template_string(
         ADMIN, name=session.get("name"),
         rows=engine.admin_overview(),
         workers=auth.list_workers(role="worker"),
-        workers_all=auth.list_workers(),
+        workers_all=everyone,
+        n_workers=sum(1 for w in everyone if w["role"] == "worker"),
+        n_qc=sum(1 for w in everyone if w["role"] == "qc"),
         brands=brand_suggestions(),
         msgs=_pop_flash())
 
@@ -351,9 +361,13 @@ def add_worker():
     name = request.form.get("name", "").strip()
     login_ = request.form.get("login", "").strip()
     pw = request.form.get("password", "").strip()
+    role = request.form.get("role", "worker").strip().lower()
+    if role not in ("worker", "qc"):
+        role = "worker"
     if name and login_ and pw:
-        r = auth.create_user(name, login_, pw, role="worker")
-        _flash(f"{'Updated' if r['updated'] else 'Added'} worker {r['name']} ({r['login']}).")
+        r = auth.create_user(name, login_, pw, role=role)
+        label = "QC" if r["role"] == "qc" else "worker"
+        _flash(f"{'Updated' if r['updated'] else 'Added'} {label} {r['name']} ({r['login']}).")
     else:
         _flash("Name, login and password are all required.")
     return redirect(url_for("admin"))

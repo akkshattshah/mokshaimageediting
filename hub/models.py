@@ -16,6 +16,7 @@ from .db import Base
 
 ROLE_ADMIN = "admin"
 ROLE_WORKER = "worker"
+ROLE_QC = "qc"
 
 # lifecycle of a single assigned photo
 ST_ASSIGNED = "assigned"       # reserved for the worker, not yet pulled
