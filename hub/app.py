@@ -138,17 +138,20 @@ ADMIN = STYLE + """
   </div>
 
   <div class="card">
-    <h2>Progress</h2>
+    <h2>Timeline</h2>
     {% if not rows %}<p class="muted">No assignments yet.</p>{% else %}
     <div class="legend">
+      <span>newest first ·</span>
       <span><i style="background:var(--good)"></i>done</span>
       <span><i style="background:var(--warn)"></i>retouching</span>
       <span><i style="background:var(--line)"></i>to download</span></div>
     <table>
-      <tr><th>Worker</th><th>Brand</th><th>Progress</th><th>Status</th><th></th></tr>
+      <tr><th>Given</th><th>Worker</th><th>Brand</th><th>Given #</th><th>Progress</th><th>Left</th><th></th></tr>
       {% for r in rows %}
       <tr>
+        <td class="muted num" style="white-space:nowrap">{{r.when}}</td>
         <td><b>{{r.worker}}</b></td><td>{{r.brand}}</td>
+        <td class="num">{{r.assigned}}</td>
         <td><div style="display:flex;gap:8px;align-items:center">
           <div class="seg">
             <div class="d" style="width:{{ (100*r.uploaded/r.assigned)|int if r.assigned else 0 }}%"></div>
@@ -156,7 +159,7 @@ ADMIN = STYLE + """
           </div>
           <span class="num muted">{{r.uploaded}}/{{r.assigned}}</span></div></td>
         <td>{% if r.remaining==0 and r.assigned>0 %}<span class="pill done">done</span>
-            {% else %}<span class="pill rem">{{r.remaining}} left</span>{% endif %}</td>
+            {% else %}<span class="pill rem">{{r.remaining}}</span>{% endif %}</td>
         <td><a href="{{url_for('assignment_view', aid=r.assignment_id)}}">details</a></td>
       </tr>
       {% endfor %}
@@ -193,10 +196,12 @@ WORKER = STYLE + """
       <span><i style="background:var(--warn)"></i>to retouch</span>
       <span><i style="background:var(--line)"></i>to download</span></div>
     <table style="margin-top:6px">
-      <tr><th>Brand</th><th>Progress</th><th>What's left</th></tr>
+      <tr><th>Given</th><th>Brand</th><th>#</th><th>Progress</th><th>What's left</th></tr>
       {% for a in summary.assignments %}
       <tr>
+        <td class="muted num" style="white-space:nowrap">{{a.when}}</td>
         <td><b>{{a.brand}}</b></td>
+        <td class="num">{{a.assigned}}</td>
         <td><div style="display:flex;gap:8px;align-items:center">
           <div class="seg">
             <div class="d" style="width:{{ (100*a.uploaded/a.assigned)|int if a.assigned else 0 }}%"></div>

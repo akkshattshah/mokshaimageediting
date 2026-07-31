@@ -114,6 +114,7 @@ def assignment_progress(assignment_id):
         c = _breakdown(photos)
         return {
             "assignment_id": a.id, "worker": a.worker.name, "brand": a.brand,
+            "when": a.created_at.strftime("%Y-%m-%d %H:%M"),
             "assigned": len(photos),
             "to_download": c[ST_ASSIGNED],       # not pulled yet
             "downloaded": c[ST_DOWNLOADED],      # pulled, being retouched
@@ -143,8 +144,9 @@ def worker_summary(worker_login):
         w = s.scalar(select(Worker).where(Worker.login == worker_login.lower()))
         if not w:
             return None
+        ordered = sorted(w.assignments, key=lambda x: x.created_at, reverse=True)
         return {"worker": w.name,
-                "assignments": [assignment_progress(a.id) for a in w.assignments]}
+                "assignments": [assignment_progress(a.id) for a in ordered]}
 
 
 _UP_EXTS = (".psd", ".jpeg", ".jpg", ".png", ".tif", ".tiff")
