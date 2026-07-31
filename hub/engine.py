@@ -105,6 +105,13 @@ def _breakdown(photos):
     return c
 
 
+def _last_upload(photos):
+    """When the most recent finished file came in (i.e. when a completed batch
+    was finished). None if nothing uploaded yet."""
+    times = [p.uploaded_at for p in photos if p.uploaded_at]
+    return max(times).strftime("%Y-%m-%d %H:%M") if times else None
+
+
 def assignment_progress(assignment_id):
     with SessionLocal() as s:
         a = s.get(Assignment, assignment_id)
@@ -115,6 +122,7 @@ def assignment_progress(assignment_id):
         return {
             "assignment_id": a.id, "worker": a.worker.name, "brand": a.brand,
             "when": a.created_at.strftime("%Y-%m-%d %H:%M"),
+            "uploaded_when": _last_upload(photos),
             "assigned": len(photos),
             "to_download": c[ST_ASSIGNED],       # not pulled yet
             "downloaded": c[ST_DOWNLOADED],      # pulled, being retouched
@@ -228,5 +236,6 @@ def admin_overview():
                 "to_download": c[ST_ASSIGNED],
                 "remaining": total - c[ST_UPLOADED],
                 "when": a.created_at.strftime("%Y-%m-%d %H:%M"),
+                "uploaded_when": _last_upload(a.photos),
             })
         return rows

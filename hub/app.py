@@ -146,12 +146,12 @@ ADMIN = STYLE + """
       <span><i style="background:var(--warn)"></i>retouching</span>
       <span><i style="background:var(--line)"></i>to download</span></div>
     <table>
-      <tr><th>Given</th><th>Worker</th><th>Brand</th><th>Given #</th><th>Progress</th><th>Left</th><th></th></tr>
+      <tr><th>Assigned</th><th>Uploaded</th><th>Worker</th><th>Brand</th><th>Progress</th><th>Left</th><th></th></tr>
       {% for r in rows %}
       <tr>
         <td class="muted num" style="white-space:nowrap">{{r.when}}</td>
+        <td class="num" style="white-space:nowrap">{% if r.uploaded_when %}<span{% if r.remaining==0 %} style="color:var(--good)"{% endif %}>{{r.uploaded_when}}</span>{% else %}<span class="muted">—</span>{% endif %}</td>
         <td><b>{{r.worker}}</b></td><td>{{r.brand}}</td>
-        <td class="num">{{r.assigned}}</td>
         <td><div style="display:flex;gap:8px;align-items:center">
           <div class="seg">
             <div class="d" style="width:{{ (100*r.uploaded/r.assigned)|int if r.assigned else 0 }}%"></div>
@@ -196,12 +196,12 @@ WORKER = STYLE + """
       <span><i style="background:var(--warn)"></i>to retouch</span>
       <span><i style="background:var(--line)"></i>to download</span></div>
     <table style="margin-top:6px">
-      <tr><th>Given</th><th>Brand</th><th>#</th><th>Progress</th><th>What's left</th></tr>
+      <tr><th>Assigned</th><th>Uploaded</th><th>Brand</th><th>Progress</th><th>What's left</th></tr>
       {% for a in summary.assignments %}
       <tr>
         <td class="muted num" style="white-space:nowrap">{{a.when}}</td>
+        <td class="num" style="white-space:nowrap">{% if a.uploaded_when %}<span{% if a.complete %} style="color:var(--good)"{% endif %}>{{a.uploaded_when}}</span>{% else %}<span class="muted">—</span>{% endif %}</td>
         <td><b>{{a.brand}}</b></td>
-        <td class="num">{{a.assigned}}</td>
         <td><div style="display:flex;gap:8px;align-items:center">
           <div class="seg">
             <div class="d" style="width:{{ (100*a.uploaded/a.assigned)|int if a.assigned else 0 }}%"></div>
