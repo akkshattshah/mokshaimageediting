@@ -5,6 +5,7 @@ and each worker's "my share" view. Run locally:  python -m hub.app
 import os
 import functools
 
+import io
 import tempfile
 import zipfile
 
@@ -204,18 +205,47 @@ WORKER = STYLE + """
           <span class="num muted">{{a.uploaded}}/{{a.assigned}}</span></div></td>
         <td>{% if a.complete %}<span class="pill done">all done</span>
             {% else %}
-              <a class="dlbtn" href="/me/download-zip/{{a.assignment_id}}">⬇ Download {{a.remaining}} photos (zip)</a>
-              {% if a.downloaded %}<span class="pill rem" style="margin-left:6px">{{a.downloaded}} to retouch</span>{% endif %}
+              <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+                <a class="dlbtn" href="/me/download-zip/{{a.assignment_id}}">⬇ Download {{a.remaining}}</a>
+                <button class="upbtn" onclick="document.getElementById('f{{a.assignment_id}}').click()">⬆ Upload finished</button>
+                <input type="file" id="f{{a.assignment_id}}" multiple style="display:none"
+                       onchange="up({{a.assignment_id}}, this)">
+                {% if a.uploaded %}<span class="pill done">{{a.uploaded}} done</span>{% endif %}
+                <span class="pill rem">{{a.remaining}} left</span>
+              </div>
+              <div id="msg{{a.assignment_id}}" class="muted" style="font-size:12px;margin-top:6px"></div>
             {% endif %}</td>
       </tr>
       {% endfor %}
     </table>
-    <p class="muted" style="font-size:12px;margin-top:14px">One zip with all your images + PSDs, organized in folders. Unzip it, retouch, then upload the finished files (upload button coming next). Big batches take a moment to zip.</p>
+    <p class="muted" style="font-size:12px;margin-top:14px">Download the zip, retouch, then <b>Upload finished</b> and pick your finished files. Each finished file is matched to its photo by name — anything you still owe stays under “left”, and your admin sees the same.</p>
     {% endif %}
   </div>
 </div>
-<style>.dlbtn{display:inline-block;padding:7px 14px;border-radius:8px;background:var(--accent);
-  color:#fff;font-size:13px;text-decoration:none}</style>
+<style>.dlbtn,.upbtn{display:inline-block;padding:7px 14px;border-radius:8px;font-size:13px;border:0;cursor:pointer}
+.dlbtn{background:var(--accent);color:#fff;text-decoration:none}
+.upbtn{background:var(--good);color:#fff}</style>
+<script>
+async function up(aid, input){
+  const files = Array.from(input.files); input.value = '';
+  if(!files.length) return;
+  const box = document.getElementById('msg' + aid);
+  let ok = 0; const skipped = [];
+  for(let i = 0; i < files.length; i++){
+    box.textContent = 'Uploading ' + (i + 1) + ' of ' + files.length + '…';
+    const fd = new FormData(); fd.append('file', files[i]);
+    try{
+      const r = await fetch('/me/upload-one/' + aid, {method:'POST', body: fd});
+      const d = await r.json();
+      if(d.matched) ok++; else skipped.push(files[i].name);
+    }catch(e){ skipped.push(files[i].name + ' (failed)'); }
+  }
+  let msg = ok + ' uploaded & verified.';
+  if(skipped.length) msg += ' ' + skipped.length + " didn't match an assigned photo (ignored).";
+  box.textContent = msg + ' Refreshing…';
+  setTimeout(() => location.reload(), 1500);
+}
+</script>
 """
 
 ASSIGN_DETAIL = STYLE + """
@@ -374,6 +404,27 @@ def me_download_zip(aid):
             pass
 
     return resp
+
+
+@app.route("/me/upload-one/<int:aid>", methods=["POST"])
+@login_required
+def me_upload_one(aid):
+    """Receive ONE finished file, match it by name to an assigned photo, push it
+    to Drive, and mark that photo done. Uploading one-at-a-time keeps each
+    request small and lets the page show live progress."""
+    if engine.assignment_owner_login(aid) != session.get("login"):
+        abort(403)
+    f = request.files.get("file")
+    if not f or not f.filename:
+        return jsonify({"error": "no file"}), 400
+    matched, _ = engine.match_uploads(aid, [f.filename])
+    pid = matched.get(f.filename)
+    if not pid:
+        return jsonify({"matched": False, "filename": f.filename})
+    fid, link = drive.upload_file(f.filename, f.mimetype, io.BytesIO(f.read()))
+    engine.mark_uploaded(aid, [pid], {pid: link})
+    return jsonify({"matched": True, "filename": f.filename,
+                    "progress": engine.assignment_progress(aid)})
 
 
 # ---- API for the worker companion (HTTP Basic auth) ----------------------

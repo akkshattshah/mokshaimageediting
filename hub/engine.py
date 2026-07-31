@@ -147,6 +147,42 @@ def worker_summary(worker_login):
                 "assignments": [assignment_progress(a.id) for a in w.assignments]}
 
 
+_UP_EXTS = (".psd", ".jpeg", ".jpg", ".png", ".tif", ".tiff")
+
+
+def _name_key(name):
+    """The comparable base of a file/photo: drop folders, extension and the
+    _orig suffix. 'abc-v4_orig.jpeg' and 'abc-v4.psd' both -> 'abc-v4'."""
+    name = name.replace("\\", "/").rsplit("/", 1)[-1]
+    low = name.lower()
+    for ext in _UP_EXTS:
+        if low.endswith(ext):
+            name = name[: -len(ext)]
+            low = low[: -len(ext)]
+            break
+    if low.endswith("_orig"):
+        name = name[: -len("_orig")]
+    return name
+
+
+def match_uploads(assignment_id, filenames):
+    """Match uploaded filenames to this assignment's not-yet-finished photos by
+    base name. Returns (matched {filename: photo_id}, unmatched [filename]).
+    Files that don't match any assigned photo are flagged as unmatched; assigned
+    photos with no matching upload simply stay 'not done' (the missing ones)."""
+    with SessionLocal() as s:
+        a = s.get(Assignment, assignment_id)
+        if not a:
+            return {}, list(filenames)
+        keymap = {_name_key(p.photo_id): p.photo_id
+                  for p in a.photos if p.status != ST_UPLOADED}
+        matched, unmatched = {}, []
+        for fn in filenames:
+            pid = keymap.get(_name_key(fn))
+            (matched.__setitem__(fn, pid) if pid else unmatched.append(fn))
+        return matched, unmatched
+
+
 def worker_assignments(login):
     """Full detail (photo ids + statuses) of a worker's assignments — used by
     the companion app over the API."""

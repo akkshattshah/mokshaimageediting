@@ -10,6 +10,7 @@ import json
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request, AuthorizedSession
 from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseUpload
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)                 # project root (token.json lives here)
@@ -91,6 +92,24 @@ def init_upload_session(name, mimetype="application/octet-stream"):
                     headers={"X-Upload-Content-Type": mimetype})
     r.raise_for_status()
     return r.headers["Location"]
+
+
+def upload_file(filename, mimetype, fileobj):
+    """Upload a finished file (a file-like object) to the uploads folder, make
+    it link-viewable, and return (file_id, share_link)."""
+    svc = _service()
+    meta = {"name": filename, "parents": [folder_id()]}
+    media = MediaIoBaseUpload(fileobj, mimetype=mimetype or "application/octet-stream",
+                              resumable=True)
+    f = svc.files().create(body=meta, media_body=media,
+                           fields="id,webViewLink").execute()
+    fid = f["id"]
+    try:
+        svc.permissions().create(
+            fileId=fid, body={"type": "anyone", "role": "reader"}).execute()
+    except Exception:  # noqa
+        pass
+    return fid, f.get("webViewLink") or f"https://drive.google.com/file/d/{fid}/view"
 
 
 def finalize(file_id):
