@@ -5,12 +5,15 @@ and each worker's "my share" view. Run locally:  python -m hub.app
 import os
 import functools
 
+import tempfile
+import zipfile
+
 from flask import (Flask, request, session, redirect, url_for,
-                   render_template_string, flash, abort, jsonify)
+                   render_template_string, flash, abort, jsonify, send_file)
 
 from .db import init_db
 from . import engine, auth, s3source, drive
-from .models import ROLE_ADMIN, ST_ASSIGNED
+from .models import ROLE_ADMIN, ST_ASSIGNED, ST_DOWNLOADED
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "dev-secret-change-me")
@@ -201,45 +204,18 @@ WORKER = STYLE + """
           <span class="num muted">{{a.uploaded}}/{{a.assigned}}</span></div></td>
         <td>{% if a.complete %}<span class="pill done">all done</span>
             {% else %}
-              {% if a.to_download %}
-                <button class="dlbtn" onclick="dl({{a.assignment_id}}, this)">⬇ Download {{a.to_download}} photos</button>
-              {% endif %}
+              <a class="dlbtn" href="/me/download-zip/{{a.assignment_id}}">⬇ Download {{a.remaining}} photos (zip)</a>
               {% if a.downloaded %}<span class="pill rem" style="margin-left:6px">{{a.downloaded}} to retouch</span>{% endif %}
             {% endif %}</td>
       </tr>
       {% endfor %}
     </table>
-    <p class="muted" style="font-size:12px;margin-top:14px">Photos download straight to your computer’s Downloads folder. Retouch them, then upload the finished files (upload button coming next).</p>
+    <p class="muted" style="font-size:12px;margin-top:14px">One zip with all your images + PSDs, organized in folders. Unzip it, retouch, then upload the finished files (upload button coming next). Big batches take a moment to zip.</p>
     {% endif %}
   </div>
 </div>
-<style>.dlbtn{padding:7px 14px;border:0;border-radius:8px;background:var(--accent);color:#fff;font-size:13px;cursor:pointer}
-.dlbtn:disabled{opacity:.7;cursor:default}</style>
-<script>
-async function dl(aid, btn){
-  btn.disabled = true; const original = btn.textContent; btn.textContent = 'Preparing…';
-  try{
-    const r = await fetch('/me/download-urls/' + aid);
-    const d = await r.json();
-    const files = d.files || [];
-    if(!files.length){ btn.textContent = 'Nothing to download'; return; }
-    btn.textContent = 'Downloading ' + files.length + ' files…';
-    const pids = [];
-    for(let i = 0; i < files.length; i++){
-      const f = files[i];
-      const a = document.createElement('a');
-      a.href = f.url; a.download = f.name;
-      document.body.appendChild(a); a.click(); a.remove();
-      if(pids.indexOf(f.photo_id) < 0) pids.push(f.photo_id);
-      await new Promise(res => setTimeout(res, 350));  // let the browser queue each
-    }
-    await fetch('/me/mark-downloaded/' + aid, {method:'POST',
-      headers:{'Content-Type':'application/json'}, body: JSON.stringify({photo_ids: pids})});
-    btn.textContent = 'Done — refreshing…';
-    setTimeout(() => location.reload(), 1200);
-  }catch(e){ btn.disabled = false; btn.textContent = original; alert('Download failed: ' + e); }
-}
-</script>
+<style>.dlbtn{display:inline-block;padding:7px 14px;border-radius:8px;background:var(--accent);
+  color:#fff;font-size:13px;text-decoration:none}</style>
 """
 
 ASSIGN_DETAIL = STYLE + """
@@ -358,27 +334,46 @@ def me():
                                   login=session.get("login"), summary=summary)
 
 
-@app.route("/me/download-urls/<int:aid>")
+@app.route("/me/download-zip/<int:aid>")
 @login_required
-def me_download_urls(aid):
+def me_download_zip(aid):
+    """Stream every not-yet-finished photo in this assignment as ONE zip
+    (image + PSD, in folders). Files come from S3 through the server only for
+    the moment it takes to zip them. Marks them downloaded on success."""
     if engine.assignment_owner_login(aid) != session.get("login"):
         abort(403)
-    files = []
-    for pid in engine.assignment_photo_ids(aid, status=ST_ASSIGNED):
-        for key in s3source.files_for_photo(pid):
-            fn = key.split("/")[-1]
-            files.append({"url": s3source.presigned_get(key, filename=fn),
-                          "name": fn, "photo_id": pid})
-    return jsonify({"files": files})
+    detail = engine.assignment_detail(aid)
+    pids = (engine.assignment_photo_ids(aid, ST_ASSIGNED)
+            + engine.assignment_photo_ids(aid, ST_DOWNLOADED))
+    if not pids:
+        abort(404)
 
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+    tmp.close()
+    try:
+        with zipfile.ZipFile(tmp.name, "w", zipfile.ZIP_STORED) as zf:
+            for pid in pids:
+                for key in s3source.files_for_photo(pid):
+                    s3source.fetch_into_zip(zf, key, s3source.local_pid(key))
+    except Exception:
+        try:
+            os.remove(tmp.name)
+        except OSError:
+            pass
+        raise
+    engine.mark_downloaded(aid, pids)
 
-@app.route("/me/mark-downloaded/<int:aid>", methods=["POST"])
-@login_required
-def me_mark_downloaded(aid):
-    if engine.assignment_owner_login(aid) != session.get("login"):
-        abort(403)
-    data = request.get_json(force=True, silent=True) or {}
-    return jsonify({"marked": engine.mark_downloaded(aid, data.get("photo_ids", []))})
+    resp = send_file(tmp.name, as_attachment=True, mimetype="application/zip",
+                     download_name=f"{detail['brand']}_assignment{aid}.zip")
+
+    @resp.call_on_close
+    def _cleanup():
+        try:
+            os.remove(tmp.name)
+        except OSError:
+            pass
+
+    return resp
 
 
 # ---- API for the worker companion (HTTP Basic auth) ----------------------

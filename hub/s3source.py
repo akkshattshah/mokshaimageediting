@@ -76,6 +76,15 @@ def presigned_get(key, expires=3600, filename=None):
         "get_object", Params=params, ExpiresIn=expires)
 
 
+def fetch_into_zip(zipf, key, arcname):
+    """Stream one S3 object straight into an open zip, a chunk at a time (never
+    loads the whole file into memory)."""
+    obj = _s3.get_object(Bucket=BUCKET, Key=key)
+    with zipf.open(arcname, "w") as dest:
+        for chunk in obj["Body"].iter_chunks(1024 * 1024):
+            dest.write(chunk)
+
+
 def available_photo_ids(brand, exclude, want=None, max_dates=8):
     """Photo ids (pool-relative) available in S3 for `brand` that are not in
     `exclude`, newest dates first. Stops once `want` are found."""
