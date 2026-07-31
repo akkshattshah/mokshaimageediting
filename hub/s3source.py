@@ -64,11 +64,16 @@ def files_for_photo(photo_id):
             if not o["Key"].endswith("/")]
 
 
-def presigned_get(key, expires=3600):
-    """A short-lived download link for one object. Lets the worker's companion
-    fetch a file over plain HTTPS without ever holding the S3 key."""
+def presigned_get(key, expires=3600, filename=None):
+    """A short-lived download link for one object. Lets a worker fetch a file
+    over plain HTTPS without ever holding the S3 key. When `filename` is given,
+    the link forces a browser 'save as' with that name (so a Download button in
+    the page downloads the file instead of opening it)."""
+    params = {"Bucket": BUCKET, "Key": key}
+    if filename:
+        params["ResponseContentDisposition"] = f'attachment; filename="{filename}"'
     return _s3.generate_presigned_url(
-        "get_object", Params={"Bucket": BUCKET, "Key": key}, ExpiresIn=expires)
+        "get_object", Params=params, ExpiresIn=expires)
 
 
 def available_photo_ids(brand, exclude, want=None, max_dates=8):

@@ -201,18 +201,45 @@ WORKER = STYLE + """
           <span class="num muted">{{a.uploaded}}/{{a.assigned}}</span></div></td>
         <td>{% if a.complete %}<span class="pill done">all done</span>
             {% else %}
-              {% if a.to_download %}<span class="num muted">{{a.to_download}} to download</span>{% endif %}
-              {% if a.to_download and a.downloaded %} · {% endif %}
-              {% if a.downloaded %}<span class="pill rem">{{a.downloaded}} to retouch</span>{% endif %}
+              {% if a.to_download %}
+                <button class="dlbtn" onclick="dl({{a.assignment_id}}, this)">⬇ Download {{a.to_download}} photos</button>
+              {% endif %}
+              {% if a.downloaded %}<span class="pill rem" style="margin-left:6px">{{a.downloaded}} to retouch</span>{% endif %}
             {% endif %}</td>
       </tr>
       {% endfor %}
     </table>
-    <p class="muted" style="font-size:13px;margin-top:14px">Use the companion app to download your photos and upload finished work:
-      <code>python -m hub.companion download --login {{login}} --password ***</code></p>
+    <p class="muted" style="font-size:12px;margin-top:14px">Photos download straight to your computer’s Downloads folder. Retouch them, then upload the finished files (upload button coming next).</p>
     {% endif %}
   </div>
 </div>
+<style>.dlbtn{padding:7px 14px;border:0;border-radius:8px;background:var(--accent);color:#fff;font-size:13px;cursor:pointer}
+.dlbtn:disabled{opacity:.7;cursor:default}</style>
+<script>
+async function dl(aid, btn){
+  btn.disabled = true; const original = btn.textContent; btn.textContent = 'Preparing…';
+  try{
+    const r = await fetch('/me/download-urls/' + aid);
+    const d = await r.json();
+    const files = d.files || [];
+    if(!files.length){ btn.textContent = 'Nothing to download'; return; }
+    btn.textContent = 'Downloading ' + files.length + ' files…';
+    const pids = [];
+    for(let i = 0; i < files.length; i++){
+      const f = files[i];
+      const a = document.createElement('a');
+      a.href = f.url; a.download = f.name;
+      document.body.appendChild(a); a.click(); a.remove();
+      if(pids.indexOf(f.photo_id) < 0) pids.push(f.photo_id);
+      await new Promise(res => setTimeout(res, 350));  // let the browser queue each
+    }
+    await fetch('/me/mark-downloaded/' + aid, {method:'POST',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify({photo_ids: pids})});
+    btn.textContent = 'Done — refreshing…';
+    setTimeout(() => location.reload(), 1200);
+  }catch(e){ btn.disabled = false; btn.textContent = original; alert('Download failed: ' + e); }
+}
+</script>
 """
 
 ASSIGN_DETAIL = STYLE + """
@@ -329,6 +356,29 @@ def me():
     summary = engine.worker_summary(session.get("login")) or {"assignments": []}
     return render_template_string(WORKER, name=session.get("name"),
                                   login=session.get("login"), summary=summary)
+
+
+@app.route("/me/download-urls/<int:aid>")
+@login_required
+def me_download_urls(aid):
+    if engine.assignment_owner_login(aid) != session.get("login"):
+        abort(403)
+    files = []
+    for pid in engine.assignment_photo_ids(aid, status=ST_ASSIGNED):
+        for key in s3source.files_for_photo(pid):
+            fn = key.split("/")[-1]
+            files.append({"url": s3source.presigned_get(key, filename=fn),
+                          "name": fn, "photo_id": pid})
+    return jsonify({"files": files})
+
+
+@app.route("/me/mark-downloaded/<int:aid>", methods=["POST"])
+@login_required
+def me_mark_downloaded(aid):
+    if engine.assignment_owner_login(aid) != session.get("login"):
+        abort(403)
+    data = request.get_json(force=True, silent=True) or {}
+    return jsonify({"marked": engine.mark_downloaded(aid, data.get("photo_ids", []))})
 
 
 # ---- API for the worker companion (HTTP Basic auth) ----------------------
