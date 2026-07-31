@@ -14,7 +14,7 @@ from flask import (Flask, request, session, redirect, url_for,
 
 from .db import init_db
 from . import engine, auth, s3source, drive
-from .models import ROLE_ADMIN, ST_ASSIGNED, ST_DOWNLOADED
+from .models import ROLE_ADMIN, ROLE_QC, ST_ASSIGNED, ST_DOWNLOADED
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "dev-secret-change-me")
@@ -121,7 +121,7 @@ ADMIN = STYLE + """
 
   <div class="card">
     <h2>Assign work</h2>
-    <form method="post" action="{{url_for('assign')}}" style="max-width:780px">
+    <form method="post" action="{{url_for('assign')}}" style="max-width:940px">
       <div class="row">
         <div><label>Worker</label>
           <select name="worker" required>
@@ -136,9 +136,14 @@ ADMIN = STYLE + """
           {% else %}
           <input name="brand" placeholder="catchall_ireland" required>
           {% endif %}</div>
-        <div style="max-width:110px"><label>Photos</label>
+        <div style="max-width:170px"><label>QC (optional)</label>
+          <select name="qc">
+            <option value="">— none —</option>
+            {% for q in qcs %}<option value="{{q.login}}">{{q.name}}</option>{% endfor %}
+          </select></div>
+        <div style="max-width:100px"><label>Photos</label>
           <input name="count" type="number" min="1" placeholder="60" required></div>
-        <div style="max-width:120px;flex:0"><button type="submit">Assign</button></div>
+        <div style="max-width:110px;flex:0"><button type="submit">Assign</button></div>
       </div>
       {% if not workers %}<p class="muted" style="font-size:13px;margin-bottom:0">Add a worker below first.</p>{% endif %}
     </form>
@@ -153,12 +158,19 @@ ADMIN = STYLE + """
       <span><i style="background:var(--warn)"></i>retouching</span>
       <span><i style="background:var(--line)"></i>to download</span></div>
     <table>
-      <tr><th>Assigned</th><th>Uploaded</th><th>Worker</th><th>Brand</th><th>Progress</th><th>Left</th><th></th></tr>
+      <tr><th>Assigned</th><th>Uploaded</th><th>Worker</th><th>QC</th><th>Brand</th><th>Progress</th><th>Left</th><th></th></tr>
       {% for r in rows %}
       <tr>
         <td class="muted num" style="white-space:nowrap">{{r.when}}</td>
         <td class="num" style="white-space:nowrap">{% if r.uploaded_when %}<span{% if r.remaining==0 %} style="color:var(--good)"{% endif %}>{{r.uploaded_when}}</span>{% else %}<span class="muted">—</span>{% endif %}</td>
-        <td><b>{{r.worker}}</b></td><td>{{r.brand}}</td>
+        <td><b>{{r.worker}}</b></td>
+        <td><form method="post" action="{{url_for('assign_qc_route')}}" style="margin:0">
+              <input type="hidden" name="assignment_id" value="{{r.assignment_id}}">
+              <select name="qc" onchange="this.form.submit()" style="padding:5px 8px;font-size:12px;max-width:130px">
+                <option value="">— assign QC —</option>
+                {% for q in qcs %}<option value="{{q.login}}" {{'selected' if q.name==r.qc else ''}}>{{q.name}}</option>{% endfor %}
+              </select></form></td>
+        <td>{{r.brand}}</td>
         <td><div style="display:flex;gap:8px;align-items:center">
           <div class="seg">
             <div class="d" style="width:{{ (100*r.uploaded/r.assigned)|int if r.assigned else 0 }}%"></div>
@@ -291,14 +303,54 @@ ASSIGN_DETAIL = STYLE + """
 </div>
 """
 
+QC = STYLE + """
+<div class="top"><b>Photo Handout · QC</b>
+  <span><span class="who">{{name}}</span><a href="{{url_for('logout')}}">Sign out</a></span></div>
+<div class="wrap">
+  <div class="card">
+    <h1>Hello, {{name}}</h1>
+    <p class="muted" style="margin-top:0">Workers assigned to you for quality check, and their live status.</p>
+    {% if not rows %}<p class="muted">Nothing assigned to you for review yet.</p>{% else %}
+    <div class="legend"><span>newest first ·</span>
+      <span><i style="background:var(--good)"></i>done</span>
+      <span><i style="background:var(--warn)"></i>retouching</span>
+      <span><i style="background:var(--line)"></i>to download</span></div>
+    <table>
+      <tr><th>Assigned</th><th>Uploaded</th><th>Worker</th><th>Brand</th><th>Progress</th><th>Status</th></tr>
+      {% for r in rows %}
+      <tr>
+        <td class="muted num" style="white-space:nowrap">{{r.when}}</td>
+        <td class="num" style="white-space:nowrap">{% if r.uploaded_when %}<span{% if r.complete %} style="color:var(--good)"{% endif %}>{{r.uploaded_when}}</span>{% else %}<span class="muted">—</span>{% endif %}</td>
+        <td><b>{{r.worker}}</b></td>
+        <td>{{r.brand}}</td>
+        <td><div style="display:flex;gap:8px;align-items:center">
+          <div class="seg">
+            <div class="d" style="width:{{ (100*r.uploaded/r.assigned)|int if r.assigned else 0 }}%"></div>
+            <div class="w" style="width:{{ (100*r.downloaded/r.assigned)|int if r.assigned else 0 }}%"></div>
+          </div><span class="num muted">{{r.uploaded}}/{{r.assigned}}</span></div></td>
+        <td>{% if r.complete %}<span class="pill done">ready to check</span>
+            {% else %}<span class="pill rem">{{r.remaining}} pending</span>{% endif %}</td>
+      </tr>
+      {% endfor %}
+    </table>
+    <p class="muted" style="font-size:12px;margin-top:14px">“Ready to check” means the worker has uploaded everything. Review actions (approve / reject) come next.</p>
+    {% endif %}
+  </div>
+</div>
+"""
+
 
 # ---- routes --------------------------------------------------------------
 @app.route("/")
 def home():
     if not session.get("uid"):
         return redirect(url_for("login"))
-    return redirect(url_for("admin") if session.get("role") == ROLE_ADMIN
-                    else url_for("me"))
+    role = session.get("role")
+    if role == ROLE_ADMIN:
+        return redirect(url_for("admin"))
+    if role == ROLE_QC:
+        return redirect(url_for("qc"))
+    return redirect(url_for("me"))
 
 
 @app.route("/login", methods=["GET", "POST"])
@@ -331,6 +383,7 @@ def admin():
         ADMIN, name=session.get("name"),
         rows=engine.admin_overview(),
         workers=auth.list_workers(role="worker"),
+        qcs=auth.list_workers(role="qc"),
         workers_all=everyone,
         n_workers=sum(1 for w in everyone if w["role"] == "worker"),
         n_qc=sum(1 for w in everyone if w["role"] == "qc"),
@@ -344,9 +397,13 @@ def assign():
     worker = request.form.get("worker", "").strip()
     brand = request.form.get("brand", "").strip()
     count = (request.form.get("count") or "").strip()
+    qc = request.form.get("qc", "").strip()
     if worker and brand and count.isdigit() and int(count) > 0:
-        res = engine.create_assignment(worker, brand, int(count))
+        res = engine.create_assignment(worker, brand, int(count),
+                                       qc_login=qc or None)
         msg = f"Assigned {res['reserved']} photo(s) of {brand} to {res['worker']}."
+        if qc:
+            msg += f" QC: {qc}."
         if res["short"]:
             msg += f" ({res['short']} short — not enough available.)"
         _flash(msg)
@@ -380,6 +437,25 @@ def assignment_view(aid):
     if not d:
         return redirect(url_for("admin"))
     return render_template_string(ASSIGN_DETAIL, name=session.get("name"), d=d)
+
+
+@app.route("/admin/assign-qc", methods=["POST"])
+@admin_required
+def assign_qc_route():
+    aid = request.form.get("assignment_id", "")
+    qc = request.form.get("qc", "").strip()
+    if aid.isdigit():
+        engine.assign_qc(int(aid), qc or None)
+    return redirect(url_for("admin"))
+
+
+@app.route("/qc")
+@login_required
+def qc():
+    if session.get("role") != ROLE_QC:
+        return redirect(url_for("home"))
+    return render_template_string(QC, name=session.get("name"),
+                                  rows=engine.qc_assignments(session.get("login")))
 
 
 @app.route("/me")

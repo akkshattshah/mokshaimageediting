@@ -36,7 +36,8 @@ class Worker(Base):
         DateTime, default=dt.datetime.utcnow)
 
     assignments: Mapped[list["Assignment"]] = relationship(
-        back_populates="worker", cascade="all, delete-orphan")
+        back_populates="worker", cascade="all, delete-orphan",
+        foreign_keys="Assignment.worker_id")
 
 
 class Assignment(Base):
@@ -44,12 +45,16 @@ class Assignment(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     worker_id: Mapped[int] = mapped_column(ForeignKey("workers.id"))
+    qc_id: Mapped[int | None] = mapped_column(
+        ForeignKey("workers.id"), nullable=True)   # QC reviewing this batch
     brand: Mapped[str] = mapped_column(String(200))
     count: Mapped[int] = mapped_column(Integer)
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime, default=dt.datetime.utcnow)
 
-    worker: Mapped["Worker"] = relationship(back_populates="assignments")
+    worker: Mapped["Worker"] = relationship(
+        back_populates="assignments", foreign_keys=[worker_id])
+    qc: Mapped["Worker | None"] = relationship(foreign_keys=[qc_id])
     photos: Mapped[list["AssignmentPhoto"]] = relationship(
         back_populates="assignment", cascade="all, delete-orphan")
 

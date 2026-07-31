@@ -37,9 +37,10 @@ def claimed_photo_ids(session, brand):
 
 
 # ---- assigning -----------------------------------------------------------
-def create_assignment(worker_login, brand, count):
+def create_assignment(worker_login, brand, count, qc_login=None):
     """Reserve up to `count` unclaimed photos of `brand` for a worker (looked up
-    by login; auto-created as a plain worker if they don't exist yet)."""
+    by login; auto-created as a plain worker if they don't exist yet). Optionally
+    assign a QC to review the batch."""
     with SessionLocal() as s:
         login = worker_login.strip().lower()
         w = s.scalar(select(Worker).where(Worker.login == login))
@@ -48,10 +49,14 @@ def create_assignment(worker_login, brand, count):
                        role=ROLE_WORKER)
             s.add(w)
             s.flush()
+        qc_id = None
+        if qc_login:
+            qc = s.scalar(select(Worker).where(Worker.login == qc_login.strip().lower()))
+            qc_id = qc.id if qc else None
         taken = claimed_photo_ids(s, brand)
         pids = s3source.available_photo_ids(brand, taken, want=count)
 
-        a = Assignment(worker_id=w.id, brand=brand, count=count)
+        a = Assignment(worker_id=w.id, qc_id=qc_id, brand=brand, count=count)
         s.add(a)
         s.flush()
         for pid in pids:
@@ -62,6 +67,21 @@ def create_assignment(worker_login, brand, count):
                 "requested": count, "reserved": len(pids),
                 "short": max(0, count - len(pids)),
                 "photo_ids": pids}
+
+
+def assign_qc(assignment_id, qc_login):
+    """Set (or clear, if qc_login is empty) the QC on an existing assignment."""
+    with SessionLocal() as s:
+        a = s.get(Assignment, assignment_id)
+        if not a:
+            return None
+        if qc_login:
+            qc = s.scalar(select(Worker).where(Worker.login == qc_login.strip().lower()))
+            a.qc_id = qc.id if qc else None
+        else:
+            a.qc_id = None
+        s.commit()
+        return {"assignment_id": a.id, "qc": a.qc.name if a.qc else None}
 
 
 # ---- progress transitions ------------------------------------------------
@@ -231,10 +251,37 @@ def admin_overview():
             total = len(a.photos)
             rows.append({
                 "assignment_id": a.id, "worker": a.worker.name,
+                "qc": a.qc.name if a.qc else None,
                 "brand": a.brand, "assigned": total,
                 "uploaded": c[ST_UPLOADED], "downloaded": c[ST_DOWNLOADED],
                 "to_download": c[ST_ASSIGNED],
                 "remaining": total - c[ST_UPLOADED],
+                "when": a.created_at.strftime("%Y-%m-%d %H:%M"),
+                "uploaded_when": _last_upload(a.photos),
+            })
+        return rows
+
+
+def qc_assignments(qc_login):
+    """The batches a QC has been assigned to review, with the worker's live
+    status. Newest first."""
+    with SessionLocal() as s:
+        qc = s.scalar(select(Worker).where(Worker.login == qc_login.strip().lower()))
+        if not qc:
+            return []
+        rows = []
+        q = (select(Assignment).where(Assignment.qc_id == qc.id)
+             .order_by(Assignment.created_at.desc()))
+        for a in s.scalars(q):
+            c = _breakdown(a.photos)
+            total = len(a.photos)
+            rows.append({
+                "assignment_id": a.id, "worker": a.worker.name,
+                "brand": a.brand, "assigned": total,
+                "uploaded": c[ST_UPLOADED], "downloaded": c[ST_DOWNLOADED],
+                "to_download": c[ST_ASSIGNED],
+                "remaining": total - c[ST_UPLOADED],
+                "complete": c[ST_UPLOADED] == total and total > 0,
                 "when": a.created_at.strftime("%Y-%m-%d %H:%M"),
                 "uploaded_when": _last_upload(a.photos),
             })
