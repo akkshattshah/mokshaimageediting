@@ -6,6 +6,7 @@ import os
 import functools
 
 import io
+import datetime as dt
 import tempfile
 import zipfile
 
@@ -13,7 +14,7 @@ from flask import (Flask, request, session, redirect, url_for,
                    render_template_string, flash, abort, jsonify, send_file)
 
 from .db import init_db
-from . import engine, auth, s3source, drive
+from . import engine, auth, s3source, drive, report
 from .models import ROLE_ADMIN, ROLE_QC, ST_ASSIGNED, ST_DOWNLOADED
 
 app = Flask(__name__)
@@ -146,6 +147,26 @@ ADMIN = STYLE + """
         <div style="max-width:110px;flex:0"><button type="submit">Assign</button></div>
       </div>
       {% if not workers %}<p class="muted" style="font-size:13px;margin-bottom:0">Add a worker below first.</p>{% endif %}
+    </form>
+  </div>
+
+  <div class="card">
+    <h2>Reports</h2>
+    <p class="muted" style="font-size:13px;margin-top:0">Download an Excel workbook of every worker's images allotted in a date range — a Summary sheet plus one sheet per worker, with allot/upload/re-upload times, QC verdicts &amp; assessor, and each worker's error rate.</p>
+    <form method="get" action="{{url_for('admin_report')}}" style="max-width:940px">
+      <div class="row">
+        <div style="max-width:180px"><label>From</label>
+          <input type="date" name="start" value="{{month_start}}" required></div>
+        <div style="max-width:180px"><label>To</label>
+          <input type="date" name="end" value="{{today}}" required></div>
+        <div style="max-width:240px"><label>Worker (optional)</label>
+          <select name="worker">
+            <option value="">All workers</option>
+            {% for w in workers %}<option value="{{w.login}}">{{w.name}} ({{w.login}})</option>{% endfor %}
+          </select></div>
+        <div style="max-width:170px;flex:0"><button type="submit">⬇ Download Excel</button></div>
+      </div>
+      <p class="muted" style="font-size:12px;margin-bottom:0">Range is by <b>allotment</b> date (e.g. 1st–31st). Times are UTC.</p>
     </form>
   </div>
 
@@ -483,6 +504,7 @@ def logout():
 @admin_required
 def admin():
     everyone = auth.list_workers()
+    today = dt.date.today()
     return render_template_string(
         ADMIN, name=session.get("name"),
         rows=engine.admin_overview(),
@@ -493,7 +515,43 @@ def admin():
         n_workers=sum(1 for w in everyone if w["role"] == "worker"),
         n_qc=sum(1 for w in everyone if w["role"] == "qc"),
         brands=brand_suggestions(),
+        today=today.isoformat(),
+        month_start=today.replace(day=1).isoformat(),
         msgs=_pop_flash())
+
+
+@app.route("/admin/report")
+@admin_required
+def admin_report():
+    """Build and stream an .xlsx report for a date range (by allotment date),
+    optionally for one worker."""
+    start_s = request.args.get("start", "").strip()
+    end_s = request.args.get("end", "").strip()
+    worker = request.args.get("worker", "").strip()
+    try:
+        start = dt.datetime.strptime(start_s, "%Y-%m-%d")
+        end_day = dt.datetime.strptime(end_s, "%Y-%m-%d")
+    except ValueError:
+        _flash("Pick a valid From and To date for the report.")
+        return redirect(url_for("admin"))
+    end = end_day + dt.timedelta(days=1)          # make the To date inclusive
+    if end <= start:
+        _flash("Report: the 'To' date must be on or after 'From'.")
+        return redirect(url_for("admin"))
+
+    data = engine.report_data(start, end, worker or None)
+    if not data["master"]:
+        who = f" for {worker}" if worker else ""
+        _flash(f"No photos were allotted{who} between {start_s} and {end_s}.")
+        return redirect(url_for("admin"))
+
+    buf = report.build_xlsx(data)
+    tag = ("_" + worker) if worker else ""
+    fname = f"worker-report_{start_s}_to_{end_s}{tag}.xlsx"
+    return send_file(
+        buf, as_attachment=True, download_name=fname,
+        mimetype="application/vnd.openxmlformats-officedocument"
+                 ".spreadsheetml.sheet")
 
 
 @app.route("/admin/assign", methods=["POST"])

@@ -30,7 +30,9 @@ def _add_missing_columns():
         "assignments": {"qc_id": "INTEGER"},
         "assignment_photos": {
             "qc": "TEXT", "qc_remark": "TEXT", "qc_shot": "TEXT",
-            "qc_at": "TIMESTAMP",
+            "qc_at": "TIMESTAMP", "first_uploaded_at": "TIMESTAMP",
+            "reuploaded_at": "TIMESTAMP", "reject_count": "INTEGER",
+            "qc_by_id": "INTEGER",
         },
     }
     for table, cols in wanted.items():

@@ -4,6 +4,7 @@ sqlalchemy
 psycopg2-binary
 boto3
 requests
+openpyxl
 google-auth
 google-auth-oauthlib
 google-api-python-client

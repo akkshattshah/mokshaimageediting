@@ -96,10 +96,16 @@ def _flip(session, assignment_id, photo_ids, new_status, drive_links=None):
     for r in rows:
         r.status = new_status
         if new_status == ST_UPLOADED:
-            r.uploaded_at = dt.datetime.utcnow()
+            now = dt.datetime.utcnow()
+            if r.first_uploaded_at is None:
+                r.first_uploaded_at = now       # original submission time
+            else:
+                r.reuploaded_at = now           # this is a redo
+            r.uploaded_at = now                 # always the latest
             if drive_links:
                 r.drive_link = drive_links.get(r.photo_id, r.drive_link)
-            # a (re)upload clears any prior QC verdict so it re-enters review
+            # a (re)upload clears the live verdict so it re-enters review, but
+            # reject_count/qc_by are left intact — they're the historical record
             r.qc = None
             r.qc_remark = ""
             r.qc_shot = ""
@@ -221,6 +227,7 @@ def qc_mark_ok(photo_row_id, qc_login):
         p.qc = QC_OK
         p.qc_remark = p.qc_shot = ""
         p.qc_at = dt.datetime.utcnow()
+        p.qc_by_id = p.assignment.qc_id      # who actually reviewed it
         aid = p.assignment_id
         s.commit()
         return aid
@@ -236,6 +243,8 @@ def qc_mark_reject(photo_row_id, qc_login, remark, shot_link=""):
         p.qc_remark = remark or ""
         p.qc_shot = shot_link or ""
         p.qc_at = dt.datetime.utcnow()
+        p.qc_by_id = p.assignment.qc_id
+        p.reject_count = (p.reject_count or 0) + 1   # counts toward error rate
         p.status = ST_DOWNLOADED     # back into the worker's "to redo" list
         aid = p.assignment_id
         s.commit()
@@ -252,6 +261,7 @@ def qc_mark_rectify(photo_row_id, qc_login, new_link):
         p.drive_link = new_link
         p.qc_remark = p.qc_shot = ""
         p.qc_at = dt.datetime.utcnow()
+        p.qc_by_id = p.assignment.qc_id
         aid = p.assignment_id
         s.commit()
         return aid
@@ -422,3 +432,103 @@ def qc_assignments(qc_login):
                 "qc_done": qc["ok"] + qc["rectified"],
             })
         return rows
+
+
+# ---- reporting -----------------------------------------------------------
+def _fmt(t):
+    return t.strftime("%Y-%m-%d %H:%M") if t else ""
+
+
+def _verdict_label(p):
+    """A human reading of where a photo stands, for the report."""
+    if p.qc == QC_OK:
+        return "Approved"
+    if p.qc == QC_RECTIFIED:
+        return "Rectified by QC"
+    if p.qc == QC_REJECT:
+        return "Rejected — redo"
+    if p.status == ST_UPLOADED:
+        return f"Pending QC (redone ×{p.reject_count})" if p.reject_count \
+            else "Pending QC"
+    if p.status == ST_DOWNLOADED:
+        return "Redoing" if p.reject_count else "Retouching"
+    return "Not downloaded"
+
+
+def _photo_row(a, p):
+    """One image's full lifecycle + QC record, as a flat dict for a report row."""
+    if p.qc_by:                         # the QC who actually made the verdict
+        by_name, by_login = p.qc_by.name, p.qc_by.login
+    elif a.qc:                          # assigned but hasn't acted yet
+        by_name, by_login = a.qc.name, a.qc.login
+    else:
+        by_name, by_login = "", ""
+    return {
+        "worker": a.worker.name, "worker_login": a.worker.login,
+        "brand": a.brand, "assignment_id": a.id,
+        "file": p.photo_id.split("/")[-1], "photo_id": p.photo_id,
+        "assigned_at": _fmt(a.created_at),
+        "uploaded_at": _fmt(p.first_uploaded_at),
+        "reuploaded_at": _fmt(p.reuploaded_at),
+        "status": p.status, "verdict": _verdict_label(p), "qc_code": p.qc,
+        "reject_count": p.reject_count or 0,
+        "uploaded_ever": p.first_uploaded_at is not None,
+        "qc_remark": p.qc_remark or "", "qc_shot": p.qc_shot or "",
+        "qc_at": _fmt(p.qc_at), "qc_by": by_name, "qc_by_login": by_login,
+    }
+
+
+def _worker_stats(rows):
+    total = len(rows)
+    uploaded = sum(1 for r in rows if r["uploaded_ever"])
+    rejected = sum(1 for r in rows if r["reject_count"] > 0)   # ever needed redo
+    approved = sum(1 for r in rows if r["qc_code"] == QC_OK)
+    rectified = sum(1 for r in rows if r["qc_code"] == QC_RECTIFIED)
+    pending = sum(1 for r in rows
+                  if r["qc_code"] is None and r["status"] == ST_UPLOADED)
+    err = round(rejected / uploaded * 100, 1) if uploaded else 0.0
+    return {"total": total, "uploaded": uploaded, "rejected": rejected,
+            "approved": approved, "rectified": rectified, "pending": pending,
+            "error_rate": err}
+
+
+def report_data(start, end, worker_login=None):
+    """Every photo whose batch was allotted in [start, end) (end exclusive),
+    grouped by worker, with per-image timestamps, QC verdict + assessor, and a
+    per-worker error rate. Optionally narrowed to a single worker."""
+    with SessionLocal() as s:
+        q = (select(Assignment)
+             .where(Assignment.created_at >= start)
+             .where(Assignment.created_at < end)
+             .order_by(Assignment.created_at))
+        if worker_login:
+            w = s.scalar(select(Worker)
+                         .where(Worker.login == worker_login.strip().lower()))
+            if not w:
+                return {"start_label": start.strftime("%Y-%m-%d"),
+                        "end_label": (end - dt.timedelta(days=1)).strftime("%Y-%m-%d"),
+                        "workers": [], "master": []}
+            q = q.where(Assignment.worker_id == w.id)
+
+        by_worker = {}
+        master = []
+        for a in s.scalars(q):
+            for p in sorted(a.photos, key=lambda x: x.photo_id):
+                row = _photo_row(a, p)
+                master.append(row)
+                wk = by_worker.setdefault(
+                    a.worker_id,
+                    {"name": a.worker.name, "login": a.worker.login, "rows": []})
+                wk["rows"].append(row)
+
+        workers = []
+        for wk in by_worker.values():
+            workers.append({**wk, **_worker_stats(wk["rows"])})
+        workers.sort(key=lambda x: x["name"].lower())
+
+        return {
+            "start_label": start.strftime("%Y-%m-%d"),
+            "end_label": (end - dt.timedelta(days=1)).strftime("%Y-%m-%d"),
+            "generated": dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M"),
+            "workers": workers, "master": master,
+        }

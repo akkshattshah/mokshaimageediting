@@ -76,12 +76,25 @@ class AssignmentPhoto(Base):
     status: Mapped[str] = mapped_column(String(20), default=ST_ASSIGNED)
     drive_link: Mapped[str] = mapped_column(Text, default="")
     uploaded_at: Mapped[dt.datetime | None] = mapped_column(
-        DateTime, nullable=True)
+        DateTime, nullable=True)                             # most recent upload
+    # kept separately so a redo doesn't erase the original submission time
+    first_uploaded_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime, nullable=True)                             # first submission
+    reuploaded_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime, nullable=True)                             # latest redo, if any
 
     # QC layer
     qc: Mapped[str | None] = mapped_column(String(20), nullable=True)
     qc_remark: Mapped[str] = mapped_column(Text, default="")
     qc_shot: Mapped[str] = mapped_column(Text, default="")   # screenshot link
     qc_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
+    # how many times this photo was rejected & sent back (for the error rate);
+    # survives the redo loop, unlike `qc` which is cleared on re-upload
+    reject_count: Mapped[int] = mapped_column(Integer, default=0)
+    # the QC who actually made the current verdict — stamped per photo because
+    # a worker's reviewer can change day to day
+    qc_by_id: Mapped[int | None] = mapped_column(
+        ForeignKey("workers.id"), nullable=True)
 
     assignment: Mapped["Assignment"] = relationship(back_populates="photos")
+    qc_by: Mapped["Worker | None"] = relationship(foreign_keys=[qc_by_id])
