@@ -112,6 +112,43 @@ def upload_file(filename, mimetype, fileobj):
     return fid, f.get("webViewLink") or f"https://drive.google.com/file/d/{fid}/view"
 
 
+def file_name(file_id, default="file"):
+    """The stored name of a Drive file (so a bulk download keeps real filenames
+    with their extensions). Falls back to `default` on any error."""
+    try:
+        authed = AuthorizedSession(_creds())
+        r = authed.get(f"https://www.googleapis.com/drive/v3/files/{file_id}",
+                       params={"fields": "name"})
+        r.raise_for_status()
+        return r.json().get("name") or default
+    except Exception:  # noqa
+        return default
+
+
+def stream_into_zip(zipf, file_id, arcname):
+    """Stream a Drive file's bytes straight into an open zip, a chunk at a time
+    (never loads the whole file into memory) — mirrors s3source.fetch_into_zip."""
+    authed = AuthorizedSession(_creds())
+    r = authed.get(f"https://www.googleapis.com/drive/v3/files/{file_id}",
+                   params={"alt": "media"}, stream=True)
+    r.raise_for_status()
+    with zipf.open(arcname, "w") as dest:
+        for chunk in r.iter_content(1024 * 1024):
+            if chunk:
+                dest.write(chunk)
+
+
+def delete_file(file_id):
+    """Best-effort delete of a file the app created (used to drop a worker's
+    version once the QC's corrected version replaces it — so each photo is
+    stored only once). Returns True on success."""
+    try:
+        _service().files().delete(fileId=file_id).execute()
+        return True
+    except Exception:  # noqa
+        return False
+
+
 def finalize(file_id):
     """After the worker uploads, make it link-viewable and return the link."""
     svc = _service()

@@ -94,6 +94,10 @@ STYLE = """
   .pill{font-size:12px;font-weight:600;padding:3px 10px;border-radius:999px;white-space:nowrap}
   .done{background:var(--good-bg);color:var(--good)} .rem{background:var(--warn-bg);color:var(--warn)}
   .flash{background:var(--good-bg);color:var(--good);padding:10px 14px;border-radius:8px;margin:12px 0;font-size:14px}
+  .note{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;
+    background:var(--warn-bg);border:1px solid var(--line);border-left:4px solid var(--accent);
+    padding:12px 14px;border-radius:8px;margin:12px 0;font-size:14px}
+  .note .xbtn{background:transparent;color:var(--muted);border:0;font-size:15px;cursor:pointer;padding:2px 8px;flex:0 0 auto}
   .muted{color:var(--muted)} .num{font-variant-numeric:tabular-nums}
   a{color:var(--accent)}
 </style>
@@ -119,6 +123,8 @@ ADMIN = STYLE + """
   <span><span class="who">{{name}}</span><a href="{{url_for('logout')}}">Sign out</a></span></div>
 <div class="wrap">
   {% for m in msgs %}<div class="flash">{{m}}</div>{% endfor %}
+  {% for nt in notes %}<div class="note"><div>{{nt.message}}</div>
+    <form method="post" action="{{url_for('dismiss_note', nid=nt.id)}}" style="margin:0"><button class="xbtn" title="Dismiss">✕</button></form></div>{% endfor %}
 
   <div class="card">
     <h2>Assign work</h2>
@@ -173,12 +179,10 @@ ADMIN = STYLE + """
   <div class="card">
     <h2>QC summary</h2>
     <div style="display:flex;gap:36px;flex-wrap:wrap;margin-top:6px">
-      <div><div class="muted" style="font-size:12px">Properly done</div>
+      <div><div class="muted" style="font-size:12px">Approved</div>
         <div class="num" style="font-size:26px;font-weight:700;color:var(--good)">{{totals.done}}</div></div>
-      <div><div class="muted" style="font-size:12px">Rectified by QC</div>
+      <div><div class="muted" style="font-size:12px">Corrected by QC</div>
         <div class="num" style="font-size:26px;font-weight:700;color:var(--accent)">{{totals.rectified}}</div></div>
-      <div><div class="muted" style="font-size:12px">Rejected</div>
-        <div class="num" style="font-size:26px;font-weight:700;color:#c5423c">{{totals.rejected}}</div></div>
     </div>
   </div>
 
@@ -215,6 +219,7 @@ ADMIN = STYLE + """
         <td>{% if r.stage=='worker' %}<span class="muted" style="font-size:12px">waiting</span>
             {% elif r.stage=='complete' %}<span class="pill done">✓ QC done</span>
             {% else %}<span class="pill" style="background:var(--warn-bg);color:var(--warn)">QC {{r.qc_done}}/{{r.assigned}}</span>{% endif %}
+            {% if r.qc_rectified %}<div style="font-size:11px;color:var(--accent)">{{r.qc_rectified}} corrected</div>{% endif %}
             {% if r.qc_rejected %}<div style="font-size:11px;color:#c5423c">{{r.qc_rejected}} rejected</div>{% endif %}
             {% if r.qc_pending %}<div style="font-size:11px" class="muted">{{r.qc_pending}} to review</div>{% endif %}</td>
         <td><a href="{{url_for('assignment_view', aid=r.assignment_id)}}">details</a></td>
@@ -252,6 +257,8 @@ WORKER = STYLE + """
 <div class="top"><b>Photo Handout · My work</b>
   <span><span class="who">{{name}}</span><a href="{{url_for('logout')}}">Sign out</a></span></div>
 <div class="wrap">
+  {% for nt in notes %}<div class="note"><div>{{nt.message}}</div>
+    <form method="post" action="{{url_for('dismiss_note', nid=nt.id)}}" style="margin:0"><button class="xbtn" title="Dismiss">✕</button></form></div>{% endfor %}
   <div class="card">
     <h1>Hello, {{name}}</h1>
     {% if not summary.assignments %}<p class="muted">No work assigned to you yet.</p>{% else %}
@@ -307,10 +314,31 @@ WORKER = STYLE + """
     {% endfor %}{% endfor %}
   </div>
   {% endif %}
+
+  {% if corrections %}
+  <div class="card">
+    <h2>What QC corrected — learn from these ({{corrections|length}})</h2>
+    <p class="muted" style="font-size:13px;margin-top:0">These are images a QC had to fix. Study them so the same issues don't come back.</p>
+    <div class="cgrid">
+      {% for c in corrections %}
+      <div class="ctile">
+        {% if c.thumb %}<a href="{{c.link}}" target="_blank"><img src="{{c.thumb}}" loading="lazy" onerror="this.parentNode.innerHTML='<div class=&quot;cph&quot;>open in Drive</div>'"></a>
+        {% else %}<div class="cph">{% if c.link %}<a href="{{c.link}}" target="_blank">open in Drive</a>{% else %}no preview{% endif %}</div>{% endif %}
+        <div style="padding:8px 10px"><b style="font-size:12px">{{c.brand}}</b>
+          <div class="num muted" style="font-size:11px">{{c.name}}</div></div>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+  {% endif %}
 </div>
 <style>.dlbtn,.upbtn{display:inline-block;padding:7px 14px;border-radius:8px;font-size:13px;border:0;cursor:pointer}
 .dlbtn{background:var(--accent);color:#fff;text-decoration:none}
-.upbtn{background:var(--good);color:#fff}</style>
+.upbtn{background:var(--good);color:#fff}
+.cgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:12px;margin-top:12px}
+.ctile{border:1px solid var(--line);border-radius:10px;overflow:hidden;background:var(--card)}
+.ctile img{width:100%;height:130px;object-fit:cover;display:block;background:var(--line);cursor:zoom-in}
+.cph{height:130px;display:grid;place-items:center;color:var(--muted);font-size:12px;background:var(--card)}</style>
 <script>
 async function up(aid, input){
   const files = Array.from(input.files); input.value = '';
@@ -400,68 +428,87 @@ QC_DETAIL = STYLE + """
   <span><span class="who">{{name}}</span><a href="{{url_for('logout')}}">Sign out</a></span></div>
 <div class="wrap">
   <a href="{{url_for('qc')}}">← back to my list</a>
+  {% for m in msgs %}<div class="flash">{{m}}</div>{% endfor %}
+
   <div class="card">
     <h1>{{d.worker}} · {{d.brand}}</h1>
-    <p class="muted" style="margin-top:0">{{d.photos|length}} photos. Mark each <b>Okay</b> or
-       <b>Reject</b> (add a note + screenshot of the issue), or upload a quick <b>Fix</b> yourself.
-       Click an image to open it full-size.</p>
+    <p class="muted" style="margin-top:0">{{d.uploaded}} of {{d.total}} photos uploaded by the worker.
+      {% if not d.all_uploaded %}<b style="color:var(--warn)">The worker hasn't finished uploading yet.</b>{% endif %}</p>
+
+    {% if d.review %}
+    <div class="flash" style="background:var(--good-bg);color:var(--good)">
+      Reviewed {{d.review.when}} — <b>{{d.review.total}}</b> checked, <b>{{d.review.corrected}}</b> corrected
+      (<b>{{d.review.rate}}%</b> error rate).{% if d.review.note %} Note to worker: “{{d.review.note}}”.{% endif %}
+      Submitting again will update it.</div>
+    {% endif %}
+
+    <div style="margin:14px 0">
+      <a class="dlbtn" href="{{url_for('qc_download_zip', aid=d.assignment_id)}}">⬇ Download all ({{d.uploaded}})</a>
+    </div>
+    <p class="muted" style="font-size:12px;margin:0">Downloads the worker's finished files as one zip. Check them, fix the bad ones, then upload below.</p>
+  </div>
+
+  <div class="card">
+    <h2>Submit your review</h2>
+    <form method="post" action="{{url_for('qc_submit_batch', aid=d.assignment_id)}}" enctype="multipart/form-data" id="qcform">
+      <div class="row" style="align-items:flex-start">
+        <div>
+          <label>Box 1 · Total — all {{d.uploaded}} reviewed files</label>
+          <input type="file" name="total" multiple>
+          <div class="muted" style="font-size:12px;margin-top:4px">Upload the whole reviewed batch. These become the final stored files.</div>
+        </div>
+        <div>
+          <label>Box 2 · Corrected — only the ones you fixed</label>
+          <input type="file" name="corrected" multiple>
+          <div class="muted" style="font-size:12px;margin-top:4px">Just the images you had to correct — these set the error rate.</div>
+        </div>
+      </div>
+      <div style="margin-top:12px;max-width:640px">
+        <label>Note to the worker (optional)</label>
+        <input name="note" placeholder="e.g. watch the reflections on the wheels">
+      </div>
+      <div style="margin-top:14px">
+        <button type="submit" id="qcbtn">Submit review &amp; notify</button>
+        <span id="qcmsg" class="muted" style="font-size:13px;margin-left:10px"></span>
+      </div>
+    </form>
+  </div>
+
+  {% if d.photos %}
+  <div class="card">
+    <h2>Worker's uploads ({{d.photos|length}})</h2>
     <div class="qgrid">
       {% for p in d.photos %}
       <div class="qtile">
         {% if p.thumb %}
           <a href="{{p.link}}" target="_blank"><img src="{{p.thumb}}" loading="lazy"
-             onerror="this.parentNode.innerHTML='<div class=&quot;qph&quot;>preview unavailable — open in Drive</div>'"></a>
-        {% else %}
-          <div class="qph">{{ 'not uploaded yet' if p.status != 'uploaded' else 'no preview' }}</div>
-        {% endif %}
+             onerror="this.parentNode.innerHTML='<div class=&quot;qph&quot;>open in Drive</div>'"></a>
+        {% else %}<div class="qph">no preview</div>{% endif %}
         <div class="qcap">
-          {% if p.qc=='ok' %}
-            <span class="pill done">✓ okay</span>
-          {% elif p.qc=='rectified' %}
-            <span class="pill" style="background:var(--good-bg);color:var(--good)">rectified by QC</span>
-            {% if p.link %}<a href="{{p.link}}" target="_blank" style="float:right;font-size:12px">view ↗</a>{% endif %}
-          {% elif p.qc=='reject' %}
-            <span class="pill rem">rejected → sent back</span>
-            {% if p.qc_remark %}<div class="muted" style="font-size:12px;margin-top:4px">“{{p.qc_remark}}”</div>{% endif %}
-          {% elif p.status=='uploaded' %}
-            <div style="display:flex;gap:5px;flex-wrap:wrap">
-              <form method="post" action="{{url_for('qc_photo_ok', pid=p.id)}}" style="margin:0"><button class="okb">Okay</button></form>
-              <button class="rjb" onclick="tgl('r{{p.id}}')">Reject</button>
-              <button class="fxb" onclick="tgl('f{{p.id}}')">Fix</button>
-            </div>
-            <form id="r{{p.id}}" class="hid" method="post" enctype="multipart/form-data" action="{{url_for('qc_photo_reject', pid=p.id)}}">
-              <textarea name="remark" placeholder="what's the issue?" rows="2"></textarea>
-              <label class="flab">screenshot (optional)<input type="file" name="shot" accept="image/*"></label>
-              <button class="rjb" style="width:100%">Send back to worker</button>
-            </form>
-            <form id="f{{p.id}}" class="hid" method="post" enctype="multipart/form-data" action="{{url_for('qc_photo_rectify', pid=p.id)}}">
-              <label class="flab">upload your fixed image<input type="file" name="file" accept="image/*" required></label>
-              <button class="fxb" style="width:100%">Upload my fix</button>
-            </form>
-          {% else %}
-            <span class="muted" style="font-size:12px">worker hasn't uploaded yet</span>
-          {% endif %}
+          <span class="num" style="font-size:11px">{{p.name}}</span>
+          {% if p.qc=='rectified' %}<span class="pill" style="background:var(--good-bg);color:var(--good);float:right">corrected</span>
+          {% elif p.qc=='ok' %}<span class="pill done" style="float:right">okay</span>{% endif %}
         </div>
       </div>
       {% endfor %}
     </div>
   </div>
+  {% endif %}
 </div>
 <style>
-  .qgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:14px;margin-top:16px}
+  .dlbtn{display:inline-block;padding:8px 16px;border-radius:8px;font-size:14px;background:var(--accent);color:#fff;text-decoration:none}
+  .qgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:12px;margin-top:12px}
   .qtile{border:1px solid var(--line);border-radius:10px;overflow:hidden;background:var(--card)}
-  .qtile img{width:100%;height:160px;object-fit:cover;display:block;background:var(--line);cursor:zoom-in}
-  .qph{height:160px;display:grid;place-items:center;text-align:center;color:var(--muted);font-size:12px;padding:0 10px;background:var(--card)}
-  .qcap{padding:9px 10px}
-  .okb{background:var(--good);color:#fff;border:0;border-radius:6px;padding:5px 11px;font-size:12px;cursor:pointer}
-  .rjb{background:#c5423c;color:#fff;border:0;border-radius:6px;padding:5px 11px;font-size:12px;cursor:pointer}
-  .fxb{background:var(--accent);color:#fff;border:0;border-radius:6px;padding:5px 11px;font-size:12px;cursor:pointer}
-  .hid{display:none;margin-top:8px}
-  .qcap textarea{width:100%;font-size:12px;padding:6px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--ink)}
-  .flab{display:block;font-size:11px;color:var(--muted);margin:6px 0}
-  .flab input{display:block;font-size:11px;margin-top:2px}
+  .qtile img{width:100%;height:140px;object-fit:cover;display:block;background:var(--line);cursor:zoom-in}
+  .qph{height:140px;display:grid;place-items:center;color:var(--muted);font-size:12px;background:var(--card)}
+  .qcap{padding:8px 10px;overflow:hidden}
 </style>
-<script>function tgl(id){var e=document.getElementById(id);e.style.display=e.style.display==='block'?'none':'block';}</script>
+<script>
+  document.getElementById('qcform').addEventListener('submit', function(){
+    document.getElementById('qcbtn').disabled = true;
+    document.getElementById('qcmsg').textContent = 'Uploading & saving… this can take a moment for large batches.';
+  });
+</script>
 """
 
 
@@ -517,6 +564,7 @@ def admin():
         brands=brand_suggestions(),
         today=today.isoformat(),
         month_start=today.replace(day=1).isoformat(),
+        notes=engine.unread_notifications(session.get("login")),
         msgs=_pop_flash())
 
 
@@ -626,61 +674,132 @@ def qc():
 def qc_assignment_view(aid):
     if session.get("role") != ROLE_QC:
         return redirect(url_for("home"))
-    d = engine.assignment_detail(aid)
+    d = engine.qc_batch_view(aid)
     if not d or d.get("qc_login") != session.get("login"):
         abort(403)          # a QC can only open batches assigned to them
-    return render_template_string(QC_DETAIL, name=session.get("name"), d=d)
+    return render_template_string(QC_DETAIL, name=session.get("name"), d=d,
+                                  msgs=_pop_flash())
 
 
-@app.route("/qc/photo/<int:pid>/ok", methods=["POST"])
+@app.route("/qc/download-zip/<int:aid>")
 @login_required
-def qc_photo_ok(pid):
+def qc_download_zip(aid):
+    """Zip the worker's finished files (streamed from Drive) so the QC can pull
+    the whole batch at once and check it offline."""
     if session.get("role") != ROLE_QC:
         abort(403)
-    aid = engine.qc_mark_ok(pid, session.get("login"))
-    if aid is None:
+    info = engine.qc_batch_download(aid, session.get("login"))
+    if info is None:
         abort(403)
+    if not info["files"]:
+        _flash("Nothing to download yet — the worker hasn't uploaded any "
+               "finished files.")
+        return redirect(url_for("qc_assignment_view", aid=aid))
+
+    # resolve real Drive names first (keeps extensions), de-duplicating clashes
+    entries, seen = [], {}
+    for it in info["files"]:
+        nm = drive.file_name(it["file_id"], default=it["name"])
+        if nm in seen:
+            seen[nm] += 1
+            root, dot, ext = nm.rpartition(".")
+            nm = f"{root}_{seen[nm]}.{ext}" if dot else f"{nm}_{seen[nm]}"
+        else:
+            seen[nm] = 1
+        entries.append((it["file_id"], nm))
+
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+    tmp.close()
+    try:
+        with zipfile.ZipFile(tmp.name, "w", zipfile.ZIP_STORED) as zf:
+            for fid, nm in entries:
+                drive.stream_into_zip(zf, fid, nm)
+    except Exception:
+        try:
+            os.remove(tmp.name)
+        except OSError:
+            pass
+        raise
+
+    resp = send_file(tmp.name, as_attachment=True, mimetype="application/zip",
+                     download_name=f"{info['brand']}_assignment{aid}_QC.zip")
+
+    @resp.call_on_close
+    def _cleanup():
+        try:
+            os.remove(tmp.name)
+        except OSError:
+            pass
+
+    return resp
+
+
+@app.route("/qc/submit-batch/<int:aid>", methods=["POST"])
+@login_required
+def qc_submit_batch(aid):
+    """Whole-batch QC review: Box 1 = the full reviewed set (becomes the final
+    stored files, replacing the worker's), Box 2 = the ones the QC corrected
+    (drives the error rate). Notifies the worker + admin."""
+    if session.get("role") != ROLE_QC:
+        abort(403)
+    d = engine.qc_batch_view(aid)
+    if not d or d.get("qc_login") != session.get("login"):
+        abort(403)
+
+    total_files = [f for f in request.files.getlist("total") if f and f.filename]
+    corrected_files = [f for f in request.files.getlist("corrected")
+                       if f and f.filename]
+    corrected_names = {f.filename for f in corrected_files}
+
+    total_links = {}
+    for f in total_files:                      # Box 1 → the final stored set
+        _, link = drive.upload_file(f.filename, f.mimetype, io.BytesIO(f.read()))
+        total_links[f.filename] = link
+    for f in corrected_files:                  # ensure Box 2 files are stored too
+        if f.filename not in total_links:
+            _, link = drive.upload_file(f.filename, f.mimetype,
+                                        io.BytesIO(f.read()))
+            total_links[f.filename] = link
+
+    if not total_links:
+        _flash("Add your files to Box 1 (and the corrected ones to Box 2) "
+               "before submitting.")
+        return redirect(url_for("qc_assignment_view", aid=aid))
+
+    result = engine.submit_qc_batch(aid, session.get("login"), total_links,
+                                    corrected_names,
+                                    request.form.get("note", "").strip())
+    if result is None:
+        abort(403)
+    # the worker's replaced files are now stale — drop them so each photo is
+    # stored only once (best effort; a leftover copy is harmless)
+    for link in result["old_links"]:
+        fid = engine.file_id_from_link(link)
+        if fid:
+            drive.delete_file(fid)
+
+    _flash(f"Review saved: {result['total']} checked, {result['corrected']} "
+           f"corrected ({result['rate']}% error rate). Worker and admin "
+           f"notified.")
     return redirect(url_for("qc_assignment_view", aid=aid))
 
 
-@app.route("/qc/photo/<int:pid>/reject", methods=["POST"])
+@app.route("/notifications/<int:nid>/dismiss", methods=["POST"])
 @login_required
-def qc_photo_reject(pid):
-    if session.get("role") != ROLE_QC:
-        abort(403)
-    if engine.photo_qc_login(pid) != session.get("login"):
-        abort(403)
-    remark = request.form.get("remark", "").strip()
-    shot_link = ""
-    f = request.files.get("shot")
-    if f and f.filename:
-        _, shot_link = drive.upload_file("QC_" + f.filename, f.mimetype,
-                                         io.BytesIO(f.read()))
-    aid = engine.qc_mark_reject(pid, session.get("login"), remark, shot_link)
-    return redirect(url_for("qc_assignment_view", aid=aid or 0))
-
-
-@app.route("/qc/photo/<int:pid>/rectify", methods=["POST"])
-@login_required
-def qc_photo_rectify(pid):
-    if session.get("role") != ROLE_QC:
-        abort(403)
-    if engine.photo_qc_login(pid) != session.get("login"):
-        abort(403)
-    f = request.files.get("file")
-    if not f or not f.filename:
-        abort(400)
-    _, link = drive.upload_file(f.filename, f.mimetype, io.BytesIO(f.read()))
-    aid = engine.qc_mark_rectify(pid, session.get("login"), link)
-    return redirect(url_for("qc_assignment_view", aid=aid or 0))
+def dismiss_note(nid):
+    engine.mark_notification_read(nid, session.get("login"))
+    return redirect(request.referrer or url_for("home"))
 
 
 @app.route("/me")
 @login_required
 def me():
-    summary = engine.worker_summary(session.get("login")) or {"assignments": []}
-    return render_template_string(WORKER, name=session.get("name"),
-                                  login=session.get("login"), summary=summary)
+    login = session.get("login")
+    summary = engine.worker_summary(login) or {"assignments": []}
+    return render_template_string(
+        WORKER, name=session.get("name"), login=login, summary=summary,
+        notes=engine.unread_notifications(login),
+        corrections=engine.worker_corrections(login))
 
 
 @app.route("/me/download-zip/<int:aid>")

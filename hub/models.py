@@ -98,3 +98,40 @@ class AssignmentPhoto(Base):
 
     assignment: Mapped["Assignment"] = relationship(back_populates="photos")
     qc_by: Mapped["Worker | None"] = relationship(foreign_keys=[qc_by_id])
+
+
+class QcReview(Base):
+    """One whole-batch QC review: what the QC reported for an assignment — how
+    many they checked, how many they had to correct, and their note to the
+    worker. corrected / total is the batch error rate."""
+    __tablename__ = "qc_reviews"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    assignment_id: Mapped[int] = mapped_column(ForeignKey("assignments.id"))
+    qc_id: Mapped[int | None] = mapped_column(
+        ForeignKey("workers.id"), nullable=True)
+    total: Mapped[int] = mapped_column(Integer, default=0)
+    corrected: Mapped[int] = mapped_column(Integer, default=0)
+    note: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime, default=dt.datetime.utcnow)
+
+    assignment: Mapped["Assignment"] = relationship()
+    qc: Mapped["Worker | None"] = relationship(foreign_keys=[qc_id])
+
+
+class Notification(Base):
+    """A one-line in-app message for a user (worker or admin), shown as a banner
+    on their dashboard until they dismiss it."""
+    __tablename__ = "notifications"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    recipient_id: Mapped[int] = mapped_column(ForeignKey("workers.id"))
+    message: Mapped[str] = mapped_column(Text)
+    assignment_id: Mapped[int | None] = mapped_column(
+        ForeignKey("assignments.id"), nullable=True)
+    is_read: Mapped[bool] = mapped_column(default=False)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime, default=dt.datetime.utcnow)
+
+    recipient: Mapped["Worker"] = relationship(foreign_keys=[recipient_id])

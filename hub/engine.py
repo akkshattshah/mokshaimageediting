@@ -12,9 +12,9 @@ import re
 from sqlalchemy import select, func
 
 from .db import SessionLocal
-from .models import (Worker, Assignment, AssignmentPhoto,
+from .models import (Worker, Assignment, AssignmentPhoto, QcReview, Notification,
                      ST_ASSIGNED, ST_DOWNLOADED, ST_UPLOADED, ROLE_WORKER,
-                     QC_OK, QC_REJECT, QC_RECTIFIED)
+                     ROLE_ADMIN, QC_OK, QC_REJECT, QC_RECTIFIED)
 from . import s3source
 
 
@@ -201,72 +201,8 @@ def assignment_detail(assignment_id):
 
 
 # ---- QC verdicts ---------------------------------------------------------
-def _qc_photo(s, photo_row_id, qc_login):
-    """Fetch a photo only if the given QC is the one assigned to its batch."""
-    p = s.get(AssignmentPhoto, photo_row_id)
-    if not p:
-        return None
-    a = p.assignment
-    if not a.qc or a.qc.login != qc_login.strip().lower():
-        return None
-    return p
-
-
-def photo_qc_login(photo_row_id):
-    """The login of the QC assigned to a photo's batch (or None)."""
-    with SessionLocal() as s:
-        p = s.get(AssignmentPhoto, photo_row_id)
-        return p.assignment.qc.login if (p and p.assignment.qc) else None
-
-
-def qc_mark_ok(photo_row_id, qc_login):
-    with SessionLocal() as s:
-        p = _qc_photo(s, photo_row_id, qc_login)
-        if not p:
-            return None
-        p.qc = QC_OK
-        p.qc_remark = p.qc_shot = ""
-        p.qc_at = dt.datetime.utcnow()
-        p.qc_by_id = p.assignment.qc_id      # who actually reviewed it
-        aid = p.assignment_id
-        s.commit()
-        return aid
-
-
-def qc_mark_reject(photo_row_id, qc_login, remark, shot_link=""):
-    """Reject: record feedback and send the photo back to the worker to redo."""
-    with SessionLocal() as s:
-        p = _qc_photo(s, photo_row_id, qc_login)
-        if not p:
-            return None
-        p.qc = QC_REJECT
-        p.qc_remark = remark or ""
-        p.qc_shot = shot_link or ""
-        p.qc_at = dt.datetime.utcnow()
-        p.qc_by_id = p.assignment.qc_id
-        p.reject_count = (p.reject_count or 0) + 1   # counts toward error rate
-        p.status = ST_DOWNLOADED     # back into the worker's "to redo" list
-        aid = p.assignment_id
-        s.commit()
-        return aid
-
-
-def qc_mark_rectify(photo_row_id, qc_login, new_link):
-    """QC fixed it themselves: replace the file and mark rectified (final)."""
-    with SessionLocal() as s:
-        p = _qc_photo(s, photo_row_id, qc_login)
-        if not p:
-            return None
-        p.qc = QC_RECTIFIED
-        p.drive_link = new_link
-        p.qc_remark = p.qc_shot = ""
-        p.qc_at = dt.datetime.utcnow()
-        p.qc_by_id = p.assignment.qc_id
-        aid = p.assignment_id
-        s.commit()
-        return aid
-
-
+# The live verdicts (QC_OK / QC_RECTIFIED) are now applied in bulk by
+# submit_qc_batch (see the batch-QC section below), not per photo.
 def _qc_counts(photos):
     """QC breakdown for a set of photos."""
     ok = sum(1 for p in photos if p.qc == QC_OK)
@@ -481,15 +417,16 @@ def _photo_row(a, p):
 def _worker_stats(rows):
     total = len(rows)
     uploaded = sum(1 for r in rows if r["uploaded_ever"])
-    rejected = sum(1 for r in rows if r["reject_count"] > 0)   # ever needed redo
+    # in the batch-QC model an "error" is a photo the QC had to correct
+    corrected = sum(1 for r in rows if r["qc_code"] == QC_RECTIFIED)
     approved = sum(1 for r in rows if r["qc_code"] == QC_OK)
-    rectified = sum(1 for r in rows if r["qc_code"] == QC_RECTIFIED)
+    rejected = sum(1 for r in rows if r["reject_count"] > 0)   # legacy redo data
     pending = sum(1 for r in rows
                   if r["qc_code"] is None and r["status"] == ST_UPLOADED)
-    err = round(rejected / uploaded * 100, 1) if uploaded else 0.0
-    return {"total": total, "uploaded": uploaded, "rejected": rejected,
-            "approved": approved, "rectified": rectified, "pending": pending,
-            "error_rate": err}
+    err = round(corrected / uploaded * 100, 1) if uploaded else 0.0
+    return {"total": total, "uploaded": uploaded, "corrected": corrected,
+            "approved": approved, "rectified": corrected, "rejected": rejected,
+            "pending": pending, "error_rate": err}
 
 
 def report_data(start, end, worker_login=None):
@@ -532,3 +469,176 @@ def report_data(start, end, worker_login=None):
             "generated": dt.datetime.utcnow().strftime("%Y-%m-%d %H:%M"),
             "workers": workers, "master": master,
         }
+
+
+# ---- batch QC (download all -> upload total + corrected) -----------------
+def file_id_from_link(link):
+    """Pull the Drive file id out of a share link (…/d/<id>/…)."""
+    if not link:
+        return None
+    m = re.search(r"/d/([^/]+)", link)
+    return m.group(1) if m else None
+
+
+def _qc_owns(a, qc_login):
+    return bool(a and a.qc and a.qc.login == qc_login.strip().lower())
+
+
+def qc_batch_view(assignment_id):
+    """Everything the QC batch page needs: worker/brand, upload progress, the
+    worker's finished photos, and the last review (if any)."""
+    with SessionLocal() as s:
+        a = s.get(Assignment, assignment_id)
+        if not a:
+            return None
+        photos = sorted(a.photos, key=lambda x: x.photo_id)
+        uploaded = [p for p in photos if p.status == ST_UPLOADED]
+        review = s.scalars(
+            select(QcReview).where(QcReview.assignment_id == a.id)
+            .order_by(QcReview.created_at.desc())).first()
+        return {
+            "assignment_id": a.id, "worker": a.worker.name, "brand": a.brand,
+            "qc_login": a.qc.login if a.qc else None,
+            "total": len(photos), "uploaded": len(uploaded),
+            "all_uploaded": bool(photos) and len(uploaded) == len(photos),
+            "photos": [{"name": p.photo_id.split("/")[-1], "link": p.drive_link,
+                        "thumb": _drive_thumb(p.drive_link), "qc": p.qc}
+                       for p in uploaded],
+            "review": ({"total": review.total, "corrected": review.corrected,
+                        "rate": round(review.corrected / review.total * 100, 1)
+                        if review.total else 0.0,
+                        "note": review.note,
+                        "when": review.created_at.strftime("%Y-%m-%d %H:%M")}
+                       if review else None),
+        }
+
+
+def qc_batch_download(assignment_id, qc_login):
+    """The Drive files (id + fallback name) of the worker's finished photos, for
+    the QC's bulk-download zip. None if this QC doesn't own the batch."""
+    with SessionLocal() as s:
+        a = s.get(Assignment, assignment_id)
+        if not _qc_owns(a, qc_login):
+            return None
+        files = []
+        for p in sorted(a.photos, key=lambda x: x.photo_id):
+            fid = file_id_from_link(p.drive_link)
+            if fid:
+                files.append({"file_id": fid, "name": p.photo_id.split("/")[-1]})
+        return {"brand": a.brand, "files": files}
+
+
+def submit_qc_batch(assignment_id, qc_login, total_links, corrected_names,
+                    note=""):
+    """Apply a whole-batch QC review.
+
+      total_links      {filename: new_drive_link} for the QC's re-uploaded set;
+                       each replaces the worker's file for the matched photo.
+      corrected_names  the filenames the QC flagged as corrected (a subset).
+      note             a short message shown to the worker.
+
+    Matched photos are marked Approved (or Corrected by QC if flagged), the
+    review is recorded, and the worker + admins are notified. Returns the counts
+    plus the worker's now-stale Drive links to clean up, or None if this QC
+    doesn't own the batch."""
+    with SessionLocal() as s:
+        a = s.get(Assignment, assignment_id)
+        if not _qc_owns(a, qc_login):
+            return None
+        photos = a.photos
+        keymap = {_name_key(p.photo_id): p for p in photos}
+        corrected_keys = {_name_key(fn) for fn in corrected_names}
+        now = dt.datetime.utcnow()
+        old_links, touched = [], set()
+
+        for fname, link in total_links.items():
+            p = keymap.get(_name_key(fname))
+            if not p:
+                continue
+            if p.drive_link and p.drive_link != link:
+                old_links.append(p.drive_link)      # worker's version, now stale
+            p.drive_link = link
+            p.status = ST_UPLOADED
+            if p.first_uploaded_at is None:
+                p.first_uploaded_at = now
+            p.qc = QC_OK
+            p.qc_remark = p.qc_shot = ""
+            p.qc_at = now
+            p.qc_by_id = a.qc_id
+            touched.add(p.id)
+
+        for p in photos:                            # flag the corrected subset
+            if p.id in touched and _name_key(p.photo_id) in corrected_keys:
+                p.qc = QC_RECTIFIED
+
+        total = sum(1 for p in photos if p.status == ST_UPLOADED)
+        corrected = sum(1 for p in photos if p.qc == QC_RECTIFIED)
+        rate = round(corrected / total * 100, 1) if total else 0.0
+
+        s.add(QcReview(assignment_id=a.id, qc_id=a.qc_id, total=total,
+                       corrected=corrected, note=note or ""))
+
+        worker_name, brand, qc_name = a.worker.name, a.brand, a.qc.name
+        wmsg = (f"QC checked your “{brand}” batch: {total} reviewed, "
+                f"{corrected} corrected ({rate}% error rate). Please make sure "
+                f"not to repeat the mistakes found in those {corrected}.")
+        if note:
+            wmsg += f"  QC note: “{note}”"
+        s.add(Notification(recipient_id=a.worker_id, message=wmsg,
+                           assignment_id=a.id))
+        amsg = (f"{qc_name} reviewed {worker_name}’s “{brand}”: {total} checked, "
+                f"{corrected} corrected — {rate}% error rate.")
+        for admin in s.scalars(select(Worker).where(Worker.role == ROLE_ADMIN)):
+            s.add(Notification(recipient_id=admin.id, message=amsg,
+                               assignment_id=a.id))
+        s.commit()
+        return {"total": total, "corrected": corrected, "rate": rate,
+                "old_links": old_links, "worker": worker_name, "brand": brand}
+
+
+def worker_corrections(login, limit=24):
+    """Recent photos a QC corrected in this worker's batches, newest first, so
+    the worker can see and learn from them."""
+    with SessionLocal() as s:
+        w = s.scalar(select(Worker).where(Worker.login == login.strip().lower()))
+        if not w:
+            return []
+        out = []
+        for a in sorted(w.assignments, key=lambda x: x.created_at, reverse=True):
+            for p in a.photos:
+                if p.qc == QC_RECTIFIED:
+                    out.append({
+                        "brand": a.brand, "name": p.photo_id.split("/")[-1],
+                        "link": p.drive_link, "thumb": _drive_thumb(p.drive_link),
+                        "when": p.qc_at.strftime("%Y-%m-%d %H:%M")
+                        if p.qc_at else ""})
+        return out[:limit]
+
+
+# ---- notifications -------------------------------------------------------
+def unread_notifications(login):
+    with SessionLocal() as s:
+        w = s.scalar(select(Worker).where(Worker.login == login.strip().lower()))
+        if not w:
+            return []
+        q = (select(Notification)
+             .where(Notification.recipient_id == w.id)
+             .where(Notification.is_read.is_(False))
+             .order_by(Notification.created_at.desc()))
+        return [{"id": n.id, "message": n.message,
+                 "assignment_id": n.assignment_id,
+                 "when": n.created_at.strftime("%Y-%m-%d %H:%M")}
+                for n in s.scalars(q)]
+
+
+def mark_notification_read(nid, login):
+    with SessionLocal() as s:
+        w = s.scalar(select(Worker).where(Worker.login == login.strip().lower()))
+        if not w:
+            return False
+        n = s.get(Notification, nid)
+        if not n or n.recipient_id != w.id:
+            return False
+        n.is_read = True
+        s.commit()
+        return True

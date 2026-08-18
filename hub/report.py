@@ -49,8 +49,7 @@ _OVERVIEW_COLS = [
     ("Assigned", "total", 11),
     ("Uploaded", "uploaded", 11),
     ("Approved", "approved", 11),
-    ("Rectified by QC", "rectified", 15),
-    ("Rejected (redo)", "rejected", 15),
+    ("Corrected by QC", "corrected", 16),
     ("Pending QC", "pending", 11),
     ("Error rate", "error_rate_str", 12),
 ]
@@ -122,7 +121,7 @@ def build_xlsx(data):
             cell.border = _BORDER
             if key == "error_rate_str":
                 cell.font = Font(bold=True,
-                                 color="C5423C" if w["rejected"] else "1C9A61")
+                                 color="C5423C" if w["corrected"] else "1C9A61")
                 if w["error_rate"] >= 10:
                     cell.fill = _WARN_FILL
         r += 1
@@ -150,13 +149,12 @@ def build_xlsx(data):
                     f"times in UTC")
         ws["A2"].font = _MUTED
         ws["A3"] = (f"Assigned {w['total']}   ·   Uploaded {w['uploaded']}   ·   "
-                    f"Approved {w['approved']}   ·   Rectified {w['rectified']}   "
-                    f"·   Rejected (redo) {w['rejected']}   ·   Pending "
-                    f"{w['pending']}")
+                    f"Approved {w['approved']}   ·   Corrected by QC "
+                    f"{w['corrected']}   ·   Pending {w['pending']}")
         ws["A3"].font = _LABEL_FONT
-        ws["A4"] = f"Error rate: {w['error_rate']}%  (rejected ÷ uploaded)"
+        ws["A4"] = f"Error rate: {w['error_rate']}%  (corrected ÷ uploaded)"
         ws["A4"].font = Font(bold=True, size=12,
-                             color="C5423C" if w["rejected"] else "1C9A61")
+                             color="C5423C" if w["corrected"] else "1C9A61")
         _header_row(ws, 6, _PHOTO_COLS)
         _detail_rows(ws, 7, w["rows"], _PHOTO_COLS)
         ws.freeze_panes = "A7"
