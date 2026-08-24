@@ -200,7 +200,15 @@ ADMIN = STYLE + """
       <tr>
         <td class="muted num" style="white-space:nowrap">{{r.when}}</td>
         <td class="num" style="white-space:nowrap">{% if r.uploaded_when %}<span{% if r.remaining==0 %} style="color:var(--good)"{% endif %}>{{r.uploaded_when}}</span>{% else %}<span class="muted">—</span>{% endif %}</td>
-        <td><b>{{r.worker}}</b></td>
+        <td><b>{{r.worker}}</b>
+          {% if r.remaining > 0 %}
+          <form method="post" action="{{url_for('reassign_worker_route')}}" style="margin-top:4px">
+            <input type="hidden" name="assignment_id" value="{{r.assignment_id}}">
+            <select name="worker" onchange="if(this.value && confirm('Move the '+{{r.remaining}}+' not-yet-uploaded photo(s) to '+this.options[this.selectedIndex].text+'? '+{{r.worker|tojson}}+' keeps credit for what they already finished.')){this.form.submit()}else{this.selectedIndex=0}" style="padding:5px 8px;font-size:12px;max-width:140px">
+              <option value="">— reassign {{r.remaining}} left —</option>
+              {% for w in workers %}{% if w.login != r.worker_login %}<option value="{{w.login}}">{{w.name}}</option>{% endif %}{% endfor %}
+            </select></form>
+          {% endif %}</td>
         <td><form method="post" action="{{url_for('assign_qc_route')}}" style="margin:0">
               <input type="hidden" name="assignment_id" value="{{r.assignment_id}}">
               <select name="qc" onchange="this.form.submit()" style="padding:5px 8px;font-size:12px;max-width:140px">
@@ -657,6 +665,26 @@ def assign_qc_route():
     qc = request.form.get("qc", "").strip()
     if aid.isdigit():
         engine.assign_qc(int(aid), qc or None)
+    return redirect(url_for("admin"))
+
+
+@app.route("/admin/reassign-worker", methods=["POST"])
+@admin_required
+def reassign_worker_route():
+    """Hand a worker's not-yet-uploaded photos off to someone else - what
+    they've already finished stays credited to them."""
+    aid = request.form.get("assignment_id", "")
+    worker = request.form.get("worker", "").strip()
+    if aid.isdigit() and worker:
+        res = engine.reassign_remaining(int(aid), worker)
+        if res is None:
+            _flash("Reassign: that batch no longer exists.")
+        elif res.get("same"):
+            _flash(f"{res['worker']} is already on that batch.")
+        elif res["moved"] == 0:
+            _flash("Nothing left to reassign - it's already fully uploaded.")
+        else:
+            _flash(f"Moved {res['moved']} remaining photo(s) to {res['worker']}.")
     return redirect(url_for("admin"))
 
 

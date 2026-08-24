@@ -86,6 +86,45 @@ def assign_qc(assignment_id, qc_login):
         return {"assignment_id": a.id, "qc": a.qc.name if a.qc else None}
 
 
+def reassign_remaining(assignment_id, new_worker_login):
+    """Hand off whatever a worker HASN'T finished yet (not-yet-uploaded photos)
+    to a different worker, as a new assignment. The original assignment is left
+    with just the photos already uploaded, so the first worker keeps credit for
+    what they actually did; the new worker gets a fresh assignment (same brand
+    & QC) with the leftovers, which they download from scratch. Photos already
+    uploaded are never touched. Returns None if the assignment doesn't exist."""
+    with SessionLocal() as s:
+        a = s.get(Assignment, assignment_id)
+        if not a:
+            return None
+        login = new_worker_login.strip().lower()
+        if login == a.worker.login:
+            return {"moved": 0, "same": True, "worker": a.worker.name}
+
+        leftover = [p for p in a.photos if p.status != ST_UPLOADED]
+        if not leftover:
+            return {"moved": 0, "same": False, "worker": None}
+
+        w = s.scalar(select(Worker).where(Worker.login == login))
+        if not w:
+            w = Worker(name=new_worker_login.strip().title(), login=login,
+                       role=ROLE_WORKER)
+            s.add(w)
+            s.flush()
+
+        new_a = Assignment(worker_id=w.id, qc_id=a.qc_id, brand=a.brand,
+                           count=len(leftover))
+        s.add(new_a)
+        s.flush()
+        for p in leftover:
+            p.status = ST_ASSIGNED       # fresh start - the new worker hasn't
+            new_a.photos.append(p)       # downloaded or touched these yet
+        a.count = max(0, a.count - len(leftover))
+        s.commit()
+        return {"moved": len(leftover), "same": False, "worker": w.name,
+                "new_assignment_id": new_a.id}
+
+
 # ---- progress transitions ------------------------------------------------
 def _flip(session, assignment_id, photo_ids, new_status, drive_links=None):
     rows = session.scalars(
@@ -315,6 +354,7 @@ def admin_overview():
             qc = _qc_counts(a.photos)
             rows.append({
                 "assignment_id": a.id, "worker": a.worker.name,
+                "worker_login": a.worker.login,
                 "qc": a.qc.name if a.qc else None,
                 "brand": a.brand, "assigned": total,
                 "uploaded": c[ST_UPLOADED], "downloaded": c[ST_DOWNLOADED],
