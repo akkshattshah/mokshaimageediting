@@ -8,9 +8,13 @@ from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.orm import sessionmaker, DeclarativeBase
 
 DB_URL = os.environ.get("DATABASE_URL", "sqlite:///hub_dev.db")
-# Railway/Heroku hand out "postgres://"; SQLAlchemy wants "postgresql://".
-if DB_URL.startswith("postgres://"):
-    DB_URL = DB_URL.replace("postgres://", "postgresql://", 1)
+# Railway/Heroku hand out "postgres://". Name the driver we install
+# (psycopg2-binary) explicitly - SQLAlchemy 2.1 changed the default for a bare
+# "postgresql://" to psycopg 3, which crashed a deploy.
+for prefix in ("postgres://", "postgresql://"):
+    if DB_URL.startswith(prefix):
+        DB_URL = "postgresql+psycopg2://" + DB_URL[len(prefix):]
+        break
 
 engine = create_engine(DB_URL, future=True, echo=False, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False, future=True)
