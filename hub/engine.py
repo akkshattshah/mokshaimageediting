@@ -8,8 +8,11 @@
 
 import datetime as dt
 import re
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 
-from sqlalchemy import select, func
+from sqlalchemy import select, func, and_, or_, update, delete
 
 from .db import SessionLocal
 from .models import (Worker, Assignment, AssignmentPhoto, QcReview, Notification,
@@ -38,17 +41,97 @@ def claimed_photo_ids(session, brand):
     return set(session.scalars(q))
 
 
+# ---- brand availability (the assign form's brand dropdown) ---------------
+# Counting a brand means listing its newest date folders in S3 - seconds for
+# the big brands - so those listings are cached for a while in each server
+# process. What's already claimed is counted fresh from the DB on every call, so
+# a new assignment shows up in the numbers straight away.
+_WINDOW_TTL = 600                     # seconds
+_windows = {}           # brand -> (listed_at, [date folders], photos in them)
+_windows_lock = threading.Lock()
+
+
+def _list_windows(brands):
+    """List each brand's newest date folders in S3 and count the photos in
+    them, many folders at once. A brand S3 fails on is skipped (left
+    uncounted) and retried next time."""
+    def dates(b):
+        try:
+            return b, s3source.date_folders(b)[:s3source.MAX_DATES]
+        except Exception:  # noqa
+            return b, None
+
+    def count(job):
+        try:
+            return job, len(s3source.folder_photo_ids(*job))
+        except Exception:  # noqa
+            return job, None
+
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        found = {b: ds for b, ds in pool.map(dates, brands) if ds is not None}
+        per = dict(pool.map(count, [(b, d) for b, ds in found.items()
+                                    for d in ds]))
+    now = time.monotonic()
+    for b, ds in found.items():
+        ns = [per[(b, d)] for d in ds]
+        if None not in ns:
+            _windows[b] = (now, ds, sum(ns))
+
+
+def brand_availability(brands, refresh=True):
+    """How many photos of each brand are still free to assign: the ones in the
+    newest date folders create_assignment draws from, minus every photo any
+    batch has already claimed. Returns ({brand: count, or None if not counted
+    yet}, stale) - stale meaning some count is missing or old enough to redo.
+    refresh=False never touches S3, so it's instant (for rendering a page)."""
+    if refresh:
+        with _windows_lock:
+            now = time.monotonic()
+            due = [b for b in brands if b not in _windows
+                   or now - _windows[b][0] > _WINDOW_TTL]
+            if due:
+                _list_windows(due)
+    known = {b: _windows[b] for b in brands if b in _windows}
+
+    # claimed photos inside each brand's window (photo ids start brand/date/)
+    conds = [and_(Assignment.brand == b,
+                  or_(*[AssignmentPhoto.photo_id.startswith(f"{b}/{d}/",
+                                                            autoescape=True)
+                        for d in ds]))
+             for b, (_, ds, _) in known.items() if ds]
+    claimed = {}
+    if conds:
+        with SessionLocal() as s:
+            claimed = dict(s.execute(
+                select(Assignment.brand, func.count())
+                .join(AssignmentPhoto,
+                      AssignmentPhoto.assignment_id == Assignment.id)
+                .where(or_(*conds))
+                .group_by(Assignment.brand)).all())
+
+    now = time.monotonic()
+    counts, stale = {}, False
+    for b in brands:
+        if b not in known:
+            counts[b], stale = None, True
+            continue
+        listed_at, _, total = known[b]
+        counts[b] = max(0, total - claimed.get(b, 0))
+        stale = stale or now - listed_at > _WINDOW_TTL
+    return counts, stale
+
+
 # ---- assigning -----------------------------------------------------------
-def create_assignment(worker_login, brand, count, qc_login=None):
+def create_assignment(worker_login, brand, count, qc_login=None, owner_id=None):
     """Reserve up to `count` unclaimed photos of `brand` for a worker (looked up
-    by login; auto-created as a plain worker if they don't exist yet). Optionally
-    assign a QC to review the batch."""
+    by login; auto-created as a plain worker on `owner_id`'s team if they don't
+    exist yet). Optionally assign a QC to review the batch."""
     with SessionLocal() as s:
         login = worker_login.strip().lower()
         w = s.scalar(select(Worker).where(Worker.login == login))
         if not w:
             w = Worker(name=worker_login.strip().title(), login=login,
-                       role=ROLE_WORKER)
+                       role=ROLE_WORKER, owner_id=owner_id)
             s.add(w)
             s.flush()
         qc_id = None
@@ -108,7 +191,7 @@ def reassign_remaining(assignment_id, new_worker_login):
         w = s.scalar(select(Worker).where(Worker.login == login))
         if not w:
             w = Worker(name=new_worker_login.strip().title(), login=login,
-                       role=ROLE_WORKER)
+                       role=ROLE_WORKER, owner_id=a.worker.owner_id)
             s.add(w)
             s.flush()
 
@@ -123,6 +206,62 @@ def reassign_remaining(assignment_id, new_worker_login):
         s.commit()
         return {"moved": len(leftover), "same": False, "worker": w.name,
                 "new_assignment_id": new_a.id}
+
+
+# ---- team management -----------------------------------------------------
+def unfinished_counts(worker_ids):
+    """{worker id: photos they still owe (assigned but not yet uploaded)}."""
+    if not worker_ids:
+        return {}
+    with SessionLocal() as s:
+        return dict(s.execute(
+            select(Assignment.worker_id, func.count())
+            .join(AssignmentPhoto, AssignmentPhoto.assignment_id == Assignment.id)
+            .where(Assignment.worker_id.in_(worker_ids))
+            .where(AssignmentPhoto.status != ST_UPLOADED)
+            .group_by(Assignment.worker_id)).all())
+
+
+def _drop_assignment(s, a):
+    """Delete a batch that no longer holds any photos, detaching the review and
+    notification rows that point at it."""
+    s.execute(delete(QcReview).where(QcReview.assignment_id == a.id))
+    s.execute(update(Notification).where(Notification.assignment_id == a.id)
+              .values(assignment_id=None))
+    s.delete(a)
+
+
+def remove_person(admin_id, person_id):
+    """Delete someone from an admin's team. They can't sign in any more and
+    drop out of every list, but their row stays so finished work keeps its name
+    in the timeline and reports. Photos they still owed go back to the pool
+    (a batch left empty is dropped), batches they were QC on lose their QC, and
+    if they were an admin, their own team moves to `admin_id`. Returns None
+    unless the person is on this admin's team (nobody can delete themself)."""
+    with SessionLocal() as s:
+        p = s.get(Worker, person_id)
+        if (not p or p.removed_at is not None or p.id == admin_id
+                or p.owner_id != admin_id):
+            return None
+        released = 0
+        for a in list(p.assignments):
+            left = [ph for ph in a.photos if ph.status != ST_UPLOADED]
+            for ph in left:
+                a.photos.remove(ph)     # delete-orphan: the row goes, the photo
+            released += len(left)       # is unclaimed again
+            a.count = max(0, a.count - len(left))
+            if not a.photos:
+                _drop_assignment(s, a)
+        unassigned = s.execute(update(Assignment)
+                               .where(Assignment.qc_id == p.id)
+                               .values(qc_id=None)).rowcount
+        moved = s.execute(update(Worker).where(Worker.owner_id == p.id)
+                          .values(owner_id=admin_id)).rowcount
+        p.removed_at = dt.datetime.utcnow()
+        p.password_hash = ""
+        s.commit()
+        return {"name": p.name, "role": p.role, "released": released,
+                "unassigned": unassigned, "moved": moved}
 
 
 # ---- progress transitions ------------------------------------------------
@@ -335,6 +474,13 @@ def assignment_owner_login(assignment_id):
         return a.worker.login if a else None
 
 
+def assignment_admin_id(assignment_id):
+    """Which admin's portal a batch belongs to - its worker's admin."""
+    with SessionLocal() as s:
+        a = s.get(Assignment, assignment_id)
+        return a.worker.owner_id if a else None
+
+
 def assignment_photo_ids(assignment_id, status=None):
     with SessionLocal() as s:
         a = s.get(Assignment, assignment_id)
@@ -344,17 +490,28 @@ def assignment_photo_ids(assignment_id, status=None):
                 if status is None or p.status == status]
 
 
-def admin_overview():
-    """One row per assignment for the admin dashboard."""
+def _owned_by(q, owner_id):
+    """Narrow an Assignment query to one admin's portal (their people's
+    batches). owner_id=None leaves it platform-wide."""
+    if owner_id is None:
+        return q
+    return (q.join(Worker, Assignment.worker_id == Worker.id)
+             .where(Worker.owner_id == owner_id))
+
+
+def admin_overview(owner_id=None):
+    """One row per assignment for an admin's dashboard, newest first."""
     with SessionLocal() as s:
         rows = []
-        for a in s.scalars(select(Assignment).order_by(Assignment.created_at.desc())):
+        q = _owned_by(select(Assignment), owner_id)
+        for a in s.scalars(q.order_by(Assignment.created_at.desc())):
             c = _breakdown(a.photos)
             total = len(a.photos)
             qc = _qc_counts(a.photos)
             rows.append({
                 "assignment_id": a.id, "worker": a.worker.name,
                 "worker_login": a.worker.login,
+                "worker_removed": a.worker.removed_at is not None,
                 "qc": a.qc.name if a.qc else None,
                 "brand": a.brand, "assigned": total,
                 "uploaded": c[ST_UPLOADED], "downloaded": c[ST_DOWNLOADED],
@@ -369,14 +526,18 @@ def admin_overview():
         return rows
 
 
-def totals():
-    """Overall QC metrics across every assignment, for the admin summary."""
+def totals(owner_id=None):
+    """Overall QC metrics across an admin's batches, for the admin summary."""
     with SessionLocal() as s:
-        photos = s.query(AssignmentPhoto).all()
+        q = _owned_by(select(AssignmentPhoto.qc, func.count())
+                      .join(Assignment,
+                            AssignmentPhoto.assignment_id == Assignment.id),
+                      owner_id)
+        c = dict(s.execute(q.group_by(AssignmentPhoto.qc)).all())
         return {
-            "done": sum(1 for p in photos if p.qc == QC_OK),
-            "rectified": sum(1 for p in photos if p.qc == QC_RECTIFIED),
-            "rejected": sum(1 for p in photos if p.qc == QC_REJECT),
+            "done": c.get(QC_OK, 0),
+            "rectified": c.get(QC_RECTIFIED, 0),
+            "rejected": c.get(QC_REJECT, 0),
         }
 
 
@@ -469,12 +630,13 @@ def _worker_stats(rows):
             "pending": pending, "error_rate": err}
 
 
-def report_data(start, end, worker_login=None):
+def report_data(start, end, worker_login=None, owner_id=None):
     """Every photo whose batch was allotted in [start, end) (end exclusive),
     grouped by worker, with per-image timestamps, QC verdict + assessor, and a
-    per-worker error rate. Optionally narrowed to a single worker."""
+    per-worker error rate. Optionally narrowed to one admin's portal and/or a
+    single worker."""
     with SessionLocal() as s:
-        q = (select(Assignment)
+        q = (_owned_by(select(Assignment), owner_id)
              .where(Assignment.created_at >= start)
              .where(Assignment.created_at < end)
              .order_by(Assignment.created_at))
@@ -553,19 +715,28 @@ def qc_batch_view(assignment_id):
         }
 
 
-def qc_batch_download(assignment_id, qc_login):
-    """The Drive files (id + fallback name) of the worker's finished photos, for
-    the QC's bulk-download zip. None if this QC doesn't own the batch."""
+def finished_files(assignment_id):
+    """The Drive files (id + fallback name) of a batch's finished photos, for a
+    bulk-download zip. None if the batch doesn't exist."""
     with SessionLocal() as s:
         a = s.get(Assignment, assignment_id)
-        if not _qc_owns(a, qc_login):
+        if not a:
             return None
         files = []
         for p in sorted(a.photos, key=lambda x: x.photo_id):
             fid = file_id_from_link(p.drive_link)
             if fid:
                 files.append({"file_id": fid, "name": p.photo_id.split("/")[-1]})
-        return {"brand": a.brand, "files": files}
+        return {"brand": a.brand, "worker": a.worker.name, "files": files}
+
+
+def qc_batch_download(assignment_id, qc_login):
+    """finished_files() for the QC's bulk download - None if this QC doesn't
+    own the batch."""
+    with SessionLocal() as s:
+        if not _qc_owns(s.get(Assignment, assignment_id), qc_login):
+            return None
+    return finished_files(assignment_id)
 
 
 def submit_qc_batch(assignment_id, qc_login, total_links, corrected_names,
@@ -628,7 +799,15 @@ def submit_qc_batch(assignment_id, qc_login, total_links, corrected_names,
                            assignment_id=a.id))
         amsg = (f"{qc_name} reviewed {worker_name}’s “{brand}”: {total} checked, "
                 f"{corrected} corrected — {rate}% error rate.")
-        for admin in s.scalars(select(Worker).where(Worker.role == ROLE_ADMIN)):
+        # tell the admin whose portal this batch is in (every admin only if
+        # that's somehow unknown)
+        owner = s.get(Worker, a.worker.owner_id) if a.worker.owner_id else None
+        if owner and owner.role == ROLE_ADMIN and owner.removed_at is None:
+            admins = [owner]
+        else:
+            admins = s.scalars(select(Worker).where(
+                Worker.role == ROLE_ADMIN, Worker.removed_at.is_(None))).all()
+        for admin in admins:
             s.add(Notification(recipient_id=admin.id, message=amsg,
                                assignment_id=a.id))
         s.commit()

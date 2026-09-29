@@ -14,6 +14,7 @@ BUCKET = os.environ.get("S3_BUCKET", "carcutter-mumbai")
 BASE = os.environ.get("S3_PREFIX", "download-retouching-files/")
 
 IMG_EXTS = (".psd", ".jpeg", ".jpg", ".png", ".tif", ".tiff")
+MAX_DATES = 8      # assignments draw from a brand's newest this-many date folders
 
 _s3 = boto3.client("s3", region_name=REGION)
 _pag = _s3.get_paginator("list_objects_v2")
@@ -85,20 +86,26 @@ def fetch_into_zip(zipf, key, arcname):
             dest.write(chunk)
 
 
-def available_photo_ids(brand, exclude, want=None, max_dates=8):
+def folder_photo_ids(brand, date):
+    """Photo ids (pool-relative) of every photo in one of a brand's date
+    folders."""
+    ids = set()
+    for page in _pag.paginate(Bucket=BUCKET, Prefix=f"{BASE}{brand}/{date}/"):
+        for o in page.get("Contents", []):
+            k = o["Key"]
+            if k.endswith("/") or not k.lower().endswith(IMG_EXTS):
+                continue
+            ids.add(local_pid(_photo_id(k)))
+    return ids
+
+
+def available_photo_ids(brand, exclude, want=None, max_dates=MAX_DATES):
     """Photo ids (pool-relative) available in S3 for `brand` that are not in
     `exclude`, newest dates first. Stops once `want` are found."""
     exclude = exclude or set()
     picked = []
     for d in date_folders(brand)[:max_dates] if max_dates else date_folders(brand):
-        ids = set()
-        for page in _pag.paginate(Bucket=BUCKET, Prefix=f"{BASE}{brand}/{d}/"):
-            for o in page.get("Contents", []):
-                k = o["Key"]
-                if k.endswith("/") or not k.lower().endswith(IMG_EXTS):
-                    continue
-                ids.add(local_pid(_photo_id(k)))
-        for pid in sorted(ids):
+        for pid in sorted(folder_photo_ids(brand, d)):
             if pid in exclude:
                 continue
             picked.append(pid)

@@ -27,6 +27,7 @@ def _add_missing_columns():
     insp = inspect(engine)
     tables = set(insp.get_table_names())
     wanted = {
+        "workers": {"owner_id": "INTEGER", "removed_at": "TIMESTAMP"},
         "assignments": {"qc_id": "INTEGER"},
         "assignment_photos": {
             "qc": "TEXT", "qc_remark": "TEXT", "qc_shot": "TEXT",
@@ -41,9 +42,16 @@ def _add_missing_columns():
         existing = {c["name"] for c in insp.get_columns(table)}
         for col, coltype in cols.items():
             if col not in existing:
-                with engine.begin() as conn:
-                    conn.execute(text(
-                        f"ALTER TABLE {table} ADD COLUMN {col} {coltype}"))
+                try:
+                    with engine.begin() as conn:
+                        conn.execute(text(
+                            f"ALTER TABLE {table} ADD COLUMN {col} {coltype}"))
+                except Exception:
+                    # the other server process may have added it at the same
+                    # moment - that's fine; anything else is a real error
+                    fresh = {c["name"] for c in inspect(engine).get_columns(table)}
+                    if col not in fresh:
+                        raise
 
 
 def init_db():

@@ -116,7 +116,8 @@ freelancer's PC.
    **Corrected**. Photos in the re-uploaded set are marked Approved, or *Corrected
    by QC* for the filenames the QC flagged. The QC's file replaces the worker's,
    and the worker's now-stale Drive file is deleted. `corrected / total` is the
-   **batch error rate**. The worker and the admins get an in-app notification.
+   **batch error rate**. The worker and the batch's admin get an in-app
+   notification.
 
    There is also a per-photo path (Okay / Reject with remark + screenshot /
    Rectify). A rejected photo returns to `downloaded` for the worker to redo.
@@ -135,7 +136,31 @@ freelancer's PC.
   assignment, so the first worker keeps credit for what they actually did. The
   moved photos reset to `assigned` so the new worker downloads them fresh.
 - **Assign / change / clear the QC** on an existing assignment.
-- **Create workers and QCs**, and see team counts.
+- **Create workers, QCs and other admins**, and see team counts.
+- **Brand counts in the Assign dropdown.** Each brand shows how many photos are
+  still free to assign: the photos in its newest 8 date folders (the same window
+  Assign draws from) minus every photo any batch has claimed. The S3 listing is
+  cached for 10 minutes per server process and loaded after the page renders
+  (the first load says "counting…"). Claimed photos are counted live, so a new
+  assignment shows up in the numbers at once.
+- **Download all** on a batch's details page: every finished file, zipped
+  straight from Drive (same mechanism as the QC's Download all).
+- **Delete people** (Team table). A deleted person can't sign in (an open
+  session is signed out on its next request) and drops out of every list and
+  dropdown. It's a soft delete (`workers.removed_at`), so finished work keeps
+  its name in the timeline ("(deleted)") and reports. Photos they hadn't
+  uploaded go back to the pool, and a batch left with nothing in it is removed.
+  A deleted QC is taken off their batches. A deleted admin's team and batches
+  move to the admin who deleted them. Re-adding the same login restores the
+  account with the new password.
+- **Several admins, separate portals.** An admin can add another admin. Every
+  account records who added it (`workers.owner_id`), and each admin's portal
+  shows only their own people: their timeline, QC summary, reports,
+  notifications and dropdowns cover their team alone, and every admin route
+  checks that the batch or person is theirs. The S3 photo pool is shared, so
+  a photo still can never go to two people. Logins are unique across the whole
+  platform, so one admin can't add (or take over) a login another admin uses.
+  Accounts from before this existed belong to the first admin.
 
 ---
 
@@ -145,7 +170,7 @@ Five tables hold the entire state of the platform.
 
 | Table | What it holds |
 |---|---|
-| `workers` | Everyone who logs in — admin, workers, QCs. `role` is `admin`/`worker`/`qc`. Passwords are werkzeug hashes, never plaintext. |
+| `workers` | Everyone who logs in — admins, workers, QCs. `role` is `admin`/`worker`/`qc`. Passwords are werkzeug hashes, never plaintext. `owner_id` is the admin who added them (empty only for the first admin); `removed_at` is set when they're deleted. |
 | `assignments` | "This worker owes N photos of brand X", plus the QC reviewing the batch. |
 | `assignment_photos` | **One row per assigned photo** — the heart of the system. Tracks status, Drive link, timestamps, and QC verdict. |
 | `qc_reviews` | One whole-batch QC report: total checked, how many corrected, note to the worker. |
@@ -178,6 +203,13 @@ out of sync.
   the photo is re-uploaded. This is what makes the error rate honest.
 - **`qc_by_id`** — stamped per photo, because a worker's reviewer can change day
   to day.
+- **`workers.owner_id`** — which admin's portal a person (and so their batches)
+  belongs to. Batches have no owner column of their own; they follow their
+  worker, which is why moving a deleted admin's team moves their batches too.
+  `auth.adopt_unowned()` runs on startup and gives any unowned account to the
+  first admin.
+- **`workers.removed_at`** — soft delete. Rows are never hard-deleted, because
+  assignments, QC reviews and verdicts point at them.
 
 ### Schema migrations
 
@@ -198,12 +230,12 @@ fresh) works fine. This is the single most likely thing to trip you up.
 
 | File | Lines | What it does |
 |---|---|---|
-| `app.py` | 992 | The whole Flask web app: routes, auth guards, and all HTML (inline via `render_template_string` — there is no `templates/` dir). Login, admin dashboard, worker "my share", QC batch pages, report download, and the JSON API for the companion. |
-| `engine.py` | 684 | All the business logic, DB-backed. Assign, reserve, status transitions, verification, QC batch application, reporting, notifications. **Start here to understand the system.** |
-| `models.py` | 137 | The five SQLAlchemy tables and the status/role constants. |
-| `db.py` | 53 | Engine/session setup, Postgres-or-SQLite selection, and the startup column migration. |
-| `auth.py` | 57 | Create users, authenticate, list, and `seed_admin()` — which guarantees one admin exists on first boot so the platform is usable immediately. |
-| `s3source.py` | 107 | Read-only view of the client's bucket: list brands and dates, derive photo IDs, find unclaimed photos, mint presigned URLs, stream objects into a ZIP. Self-contained (mirrors the desktop tool's ID logic) so the platform deploys alone. |
+| `app.py` | 1154 | The whole Flask web app: routes, auth guards, and all HTML (inline via `render_template_string` — there is no `templates/` dir). Login, admin dashboard (per-admin), batch details + Download all, team management, worker "my share", QC batch pages, report download, and the JSON API for the companion. |
+| `engine.py` | 863 | All the business logic, DB-backed. Assign, reserve, brand availability counts, status transitions, verification, deleting people, QC batch application, reporting, notifications. **Start here to understand the system.** |
+| `models.py` | 146 | The five SQLAlchemy tables and the status/role constants. |
+| `db.py` | 54 | Engine/session setup, Postgres-or-SQLite selection, and the startup column migration. |
+| `auth.py` | 123 | Create users, authenticate, list, per-admin ownership (`add_person`, `adopt_unowned`), and `seed_admin()`, which guarantees one admin exists on first boot so the platform is usable immediately. |
+| `s3source.py` | 114 | Read-only view of the client's bucket: list brands and dates, derive photo IDs, find unclaimed photos, mint presigned URLs, stream objects into a ZIP. Self-contained (mirrors the desktop tool's ID logic) so the platform deploys alone. |
 | `drive.py` | 161 | Google Drive: holds the credentials, mints short-lived resumable-upload sessions, streams files into ZIPs, deletes superseded files. Reads creds from `GOOGLE_TOKEN_JSON` (Railway) or `token.json` (local). |
 | `report.py` | 165 | Turns `engine.report_data()` into a formatted Excel workbook (openpyxl) — Summary sheet plus one sheet per worker. |
 | `companion.py` | 170 | Optional CLI that runs on a worker's own PC: signs in over the API, downloads their assigned photos into `./worker_pool/`, uploads finished work. Largely superseded by the in-browser download/upload buttons. |
@@ -226,7 +258,7 @@ fresh) works fine. This is the single most likely thing to trip you up.
 | File | What it does |
 |---|---|
 | `requirements.txt` | Python dependencies. |
-| `Procfile` | Railway start command: `gunicorn hub.app:app`. |
+| `Procfile` | Railway start command: `gunicorn hub.app:app` with threaded workers (`gthread`). Keep them threaded: with gunicorn's default sync workers, `--timeout 120` also caps how long a request may take, so big zip downloads and uploads would be killed after 2 minutes. |
 | `mise.toml` | Pins Python 3.12; disables the GitHub attestation check that broke the Railway build. |
 | `.gitignore` | Excludes all secrets and local data. **Do not weaken this.** |
 | `HOW TO USE.txt` | End-user instructions for the desktop tool. |
@@ -347,9 +379,13 @@ from the admin screen; changing the variable won't change an existing password.
 - **A "photo" is always the pair** (`.psd` + `_orig` image) counted as one. Every
   count in the UI, the reservations, and the reports use this rule.
 - **Reservations are permanent.** `claimed_photo_ids()` excludes photos claimed by
-  *any* assignment for a brand, forever. There is currently **no way to release a
-  reservation** from the UI — deleting the assignment row is the only route. Worth
-  knowing before you assign 5,000 photos by accident.
+  *any* assignment for a brand (across every admin), forever. The only way to
+  release photos from the UI is to **delete the worker** they were assigned to,
+  which frees whatever that worker hadn't uploaded. There is no per-batch
+  release. Worth knowing before you assign 5,000 photos by accident.
+- **Brand counts only cover the newest 8 date folders** (`s3source.MAX_DATES`),
+  because that's all Assign draws from. A brand can have more photos in older
+  folders that neither the count nor Assign will ever reach.
 - **Filename matching is by base name.** If a worker renames files, the upload
   won't match and will be reported as unmatched. Tell workers to keep filenames.
 - **All times are UTC**, in both the dashboards and the Excel export. There is no
@@ -373,7 +409,8 @@ These are genuinely unfinished, listed so the next owner isn't surprised:
    download phase only. The QC and reporting logic has no coverage.
 2. **All HTML is inline** in `app.py` via `render_template_string` (992 lines).
    Splitting it into real templates is the obvious first refactor.
-3. **No way to un-reserve photos** from the UI (see §9).
+3. **No per-batch un-reserve** from the UI. Deleting a worker frees their
+   unfinished photos, but there's no way to release part of a batch (see §9).
 4. **No Alembic** — migrations are the hand-rolled column-adder in `db.py`. Fine
    at this size, but remember the rule in §4.
 5. **The companion CLI is half-superseded** by the in-browser buttons and isn't

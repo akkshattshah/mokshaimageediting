@@ -6,22 +6,25 @@ import os
 import functools
 
 import io
+import re
 import datetime as dt
 import tempfile
 import zipfile
 
-from flask import (Flask, request, session, redirect, url_for,
+from flask import (Flask, request, session, redirect, url_for, g,
                    render_template_string, flash, abort, jsonify, send_file)
 
 from .db import init_db
 from . import engine, auth, s3source, drive, report
-from .models import ROLE_ADMIN, ROLE_QC, ST_ASSIGNED, ST_DOWNLOADED
+from .models import (ROLE_ADMIN, ROLE_QC, ROLE_WORKER, ST_ASSIGNED,
+                     ST_DOWNLOADED)
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "dev-secret-change-me")
 
 init_db()
 auth.seed_admin()
+auth.adopt_unowned()
 
 
 # ---- brand suggestions (for the assign box) ------------------------------
@@ -36,10 +39,25 @@ def brand_suggestions():
 
 
 # ---- auth guards ---------------------------------------------------------
+def current_user():
+    """The signed-in account, re-read from the DB on every request - so someone
+    who's been deleted is signed out straight away, and a changed name or role
+    takes effect without signing in again."""
+    if "user" not in g:
+        u = auth.get_user(session["uid"]) if session.get("uid") else None
+        if u:
+            for k in ("role", "name", "login"):
+                if session.get(k) != u[k]:
+                    session[k] = u[k]
+        g.user = u
+    return g.user
+
+
 def login_required(view):
     @functools.wraps(view)
     def wrapped(*a, **kw):
-        if not session.get("uid"):
+        if not current_user():
+            session.clear()
             return redirect(url_for("login"))
         return view(*a, **kw)
     return wrapped
@@ -48,9 +66,10 @@ def login_required(view):
 def admin_required(view):
     @functools.wraps(view)
     def wrapped(*a, **kw):
-        if not session.get("uid"):
+        if not current_user():
+            session.clear()
             return redirect(url_for("login"))
-        if session.get("role") != ROLE_ADMIN:
+        if g.user["role"] != ROLE_ADMIN:
             abort(403)
         return view(*a, **kw)
     return wrapped
@@ -136,9 +155,9 @@ ADMIN = STYLE + """
           </select></div>
         <div><label>Brand</label>
           {% if brands %}
-          <select name="brand" required>
+          <select name="brand" id="brandsel" required>
             <option value="" disabled selected>Choose a brand…</option>
-            {% for b in brands %}<option value="{{b}}">{{b}}</option>{% endfor %}
+            {% for b in brands %}<option value="{{b}}" data-brand="{{b}}">{{b}} — {{ '{:,}'.format(avail[b]) ~ ' available' if avail[b] is not none else 'counting…' }}</option>{% endfor %}
           </select>
           {% else %}
           <input name="brand" placeholder="catchall_ireland" required>
@@ -200,11 +219,11 @@ ADMIN = STYLE + """
       <tr>
         <td class="muted num" style="white-space:nowrap">{{r.when}}</td>
         <td class="num" style="white-space:nowrap">{% if r.uploaded_when %}<span{% if r.remaining==0 %} style="color:var(--good)"{% endif %}>{{r.uploaded_when}}</span>{% else %}<span class="muted">—</span>{% endif %}</td>
-        <td><b>{{r.worker}}</b>
+        <td><b>{{r.worker}}</b>{% if r.worker_removed %} <span class="muted" style="font-size:12px">(deleted)</span>{% endif %}
           {% if r.remaining > 0 %}
           <form method="post" action="{{url_for('reassign_worker_route')}}" style="margin-top:4px">
             <input type="hidden" name="assignment_id" value="{{r.assignment_id}}">
-            <select name="worker" onchange="if(this.value && confirm('Move the '+{{r.remaining}}+' not-yet-uploaded photo(s) to '+this.options[this.selectedIndex].text+'? '+{{r.worker|tojson}}+' keeps credit for what they already finished.')){this.form.submit()}else{this.selectedIndex=0}" style="padding:5px 8px;font-size:12px;max-width:140px">
+            <select name="worker" onchange="if(this.value && confirm('Move the '+{{r.remaining}}+' not-yet-uploaded photo(s) to '+this.options[this.selectedIndex].text+'? '+{{r.worker|tojson|forceescape}}+' keeps credit for what they already finished.')){this.form.submit()}else{this.selectedIndex=0}" style="padding:5px 8px;font-size:12px;max-width:140px">
               <option value="">— reassign {{r.remaining}} left —</option>
               {% for w in workers %}{% if w.login != r.worker_login %}<option value="{{w.login}}">{{w.name}}</option>{% endif %}{% endfor %}
             </select></form>
@@ -239,13 +258,17 @@ ADMIN = STYLE + """
   <div class="card">
     <h2>Team</h2>
     <div class="muted" style="font-size:13px;margin-bottom:10px">
-      {{n_workers}} worker{{ 's' if n_workers != 1 else '' }} · {{n_qc}} QC</div>
+      {{n_workers}} worker{{ 's' if n_workers != 1 else '' }} · {{n_qc}} QC{% if n_admins %} · {{n_admins}} admin{{ 's' if n_admins != 1 else '' }}{% endif %}</div>
     <table>
-      <tr><th>Name</th><th>Login</th><th>Role</th></tr>
-      {% for w in workers_all %}<tr><td>{{w.name}}</td><td class="muted">{{w.login}}</td>
+      <tr><th>Name</th><th>Login</th><th>Role</th><th></th></tr>
+      {% for w in team %}<tr><td>{{w.name}}{% if w.is_me %} <span class="muted" style="font-size:12px">(you)</span>{% endif %}</td><td class="muted">{{w.login}}</td>
         <td>{% if w.role=='qc' %}<span class="pill" style="background:var(--warn-bg);color:var(--warn)">QC</span>
-            {% elif w.role=='admin' %}<span class="muted">admin</span>
-            {% else %}<span class="pill" style="background:var(--good-bg);color:var(--good)">worker</span>{% endif %}</td></tr>{% endfor %}
+            {% elif w.role=='admin' and w.is_me %}<span class="muted">admin</span>
+            {% elif w.role=='admin' %}<span class="pill adm">admin</span>
+            {% else %}<span class="pill" style="background:var(--good-bg);color:var(--good)">worker</span>{% endif %}</td>
+        <td style="text-align:right">{% if not w.is_me %}
+          <form method="post" action="{{url_for('delete_person', pid=w.id)}}" style="margin:0" onsubmit='return confirm({{ w.confirm|tojson }})'>
+            <button type="submit" class="delbtn">Delete</button></form>{% endif %}</td></tr>{% endfor %}
     </table>
     <form method="post" action="{{url_for('add_worker')}}" style="margin-top:16px;max-width:900px">
       <div class="row">
@@ -253,12 +276,35 @@ ADMIN = STYLE + """
         <div><label>Login</label><input name="login" placeholder="yash" required></div>
         <div><label>Password</label><input name="password" required></div>
         <div style="max-width:130px"><label>Role</label>
-          <select name="role"><option value="worker">Worker</option><option value="qc">QC</option></select></div>
+          <select name="role" onchange="document.getElementById('adminhint').style.display = this.value == 'admin' ? '' : 'none'">
+            <option value="worker">Worker</option><option value="qc">QC</option><option value="admin">Admin</option></select></div>
         <div style="max-width:100px;flex:0"><button type="submit">Add</button></div>
       </div>
+      <p id="adminhint" class="muted" style="font-size:12px;margin-bottom:0;display:none">A new admin gets a separate portal of their own: their own team, batches and reports. They won't see yours and you won't see theirs.</p>
     </form>
   </div>
 </div>
+<style>
+  .delbtn{background:transparent;color:#c5423c;border:1px solid var(--line);padding:4px 12px;font-size:12px}
+  .delbtn:hover{border-color:#c5423c}
+  .pill.adm{background:var(--line);color:var(--accent)}
+</style>
+{% if brands and avail_stale %}
+<script>
+  // counting a brand's photos can take S3 a few seconds, so the page loads
+  // straight away and the numbers are filled in once they're ready
+  fetch("{{ url_for('brand_counts') }}").then(r => r.json()).then(d => {
+    document.querySelectorAll('#brandsel option[data-brand]').forEach(o => {
+      const n = d.counts[o.dataset.brand];
+      o.textContent = o.dataset.brand + (n == null ? '' : ' — ' + n.toLocaleString('en-US') + ' available');
+    });
+  }).catch(() => {
+    document.querySelectorAll('#brandsel option[data-brand]').forEach(o => {
+      if (o.textContent.endsWith('counting…')) o.textContent = o.dataset.brand;
+    });
+  });
+</script>
+{% endif %}
 """
 
 WORKER = STYLE + """
@@ -375,9 +421,20 @@ ASSIGN_DETAIL = STYLE + """
   <span><span class="who">{{name}}</span><a href="{{url_for('logout')}}">Sign out</a></span></div>
 <div class="wrap">
   <a href="{{url_for('admin')}}">← back to dashboard</a>
+  {% for m in msgs %}<div class="flash">{{m}}</div>{% endfor %}
   <div class="card">
-    <h1>{{d.worker}} · {{d.brand}}</h1>
-    <p class="muted" style="margin-top:0">{{d.photos|length}} photos · assigned {{d.when}}</p>
+    {% set n_files = d.photos|selectattr('link')|list|length %}
+    <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap">
+      <div>
+        <h1>{{d.worker}} · {{d.brand}}</h1>
+        <p class="muted" style="margin-top:0">{{d.photos|length}} photos · assigned {{d.when}}</p>
+      </div>
+      {% if n_files %}<div>
+        <a class="dlbtn" href="{{url_for('admin_download_zip', aid=d.assignment_id)}}"
+           onclick="document.getElementById('dlhint').textContent = 'Preparing the zip — the download will start shortly…'">⬇ Download all ({{n_files}})</a>
+        <div id="dlhint" class="muted" style="font-size:12px;margin-top:6px">Every finished file in one zip.</div>
+      </div>{% endif %}
+    </div>
     <table>
       <tr><th>Photo</th><th>Status</th><th>Finished file</th></tr>
       {% for p in d.photos %}
@@ -392,6 +449,7 @@ ASSIGN_DETAIL = STYLE + """
     </table>
   </div>
 </div>
+<style>.dlbtn{display:inline-block;padding:8px 16px;border-radius:8px;font-size:14px;background:var(--accent);color:#fff;text-decoration:none}</style>
 """
 
 QC = STYLE + """
@@ -520,10 +578,87 @@ QC_DETAIL = STYLE + """
 """
 
 
+# ---- helpers -------------------------------------------------------------
+def _on_team(login, role):
+    """Is `login` an active `role` on the signed-in admin's own team?"""
+    login = login.strip().lower()
+    return any(p["login"] == login
+               for p in auth.list_workers(role=role, owner_id=g.user["id"]))
+
+
+def _my_batch(aid):
+    """Is this batch on the signed-in admin's own dashboard?"""
+    return engine.assignment_admin_id(aid) == g.user["id"]
+
+
+def _team_rows(me, team):
+    """The Team table: the admin first, then everyone on their team, each with
+    the warning shown before deleting them."""
+    owes = engine.unfinished_counts([p["id"] for p in team])
+    rows = [{**me, "is_me": True, "confirm": ""}]
+    for p in team:
+        if p["role"] == ROLE_ADMIN:
+            msg = (f"Delete admin {p['name']}? They won't be able to sign in any "
+                   f"more, and their team and batches move to your dashboard.")
+        elif p["role"] == ROLE_QC:
+            msg = (f"Delete {p['name']}? They won't be able to sign in any more, "
+                   f"and they'll be taken off the batches they were set to check.")
+        else:
+            msg = f"Delete {p['name']}? They won't be able to sign in any more."
+            if owes.get(p["id"]):
+                msg += (f" The {owes[p['id']]} photo(s) they haven't finished go "
+                        f"back to the pool, so you can assign them again.")
+            msg += " Work they've already finished stays in the timeline and reports."
+        rows.append({**p, "is_me": False, "confirm": msg})
+    return rows
+
+
+def _drive_zip(files, download_name):
+    """Send Drive files as one zip, built in a temp file (each file streamed in
+    a chunk at a time) that's deleted once the download is done."""
+    # resolve real Drive names first (keeps extensions), de-duplicating clashes
+    entries, seen = [], {}
+    for it in files:
+        nm = drive.file_name(it["file_id"], default=it["name"])
+        if nm in seen:
+            seen[nm] += 1
+            root, dot, ext = nm.rpartition(".")
+            nm = f"{root}_{seen[nm]}.{ext}" if dot else f"{nm}_{seen[nm]}"
+        else:
+            seen[nm] = 1
+        entries.append((it["file_id"], nm))
+
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+    tmp.close()
+    try:
+        with zipfile.ZipFile(tmp.name, "w", zipfile.ZIP_STORED) as zf:
+            for fid, nm in entries:
+                drive.stream_into_zip(zf, fid, nm)
+    except Exception:
+        try:
+            os.remove(tmp.name)
+        except OSError:
+            pass
+        raise
+
+    resp = send_file(tmp.name, as_attachment=True, mimetype="application/zip",
+                     download_name=download_name)
+
+    @resp.call_on_close
+    def _cleanup():
+        try:
+            os.remove(tmp.name)
+        except OSError:
+            pass
+
+    return resp
+
+
 # ---- routes --------------------------------------------------------------
 @app.route("/")
 def home():
-    if not session.get("uid"):
+    if not current_user():
+        session.clear()
         return redirect(url_for("login"))
     role = session.get("role")
     if role == ROLE_ADMIN:
@@ -558,22 +693,37 @@ def logout():
 @app.route("/admin")
 @admin_required
 def admin():
-    everyone = auth.list_workers()
+    """An admin's own portal: only their team, their team's batches, and
+    their numbers. The photo pool (brands) is shared by every admin."""
+    me = g.user
+    team = auth.list_workers(owner_id=me["id"])      # everyone they added
+    brands = brand_suggestions()
+    avail, avail_stale = engine.brand_availability(brands, refresh=False)
     today = dt.date.today()
     return render_template_string(
-        ADMIN, name=session.get("name"),
-        rows=engine.admin_overview(),
-        totals=engine.totals(),
-        workers=auth.list_workers(role="worker"),
-        qcs=auth.list_workers(role="qc"),
-        workers_all=everyone,
-        n_workers=sum(1 for w in everyone if w["role"] == "worker"),
-        n_qc=sum(1 for w in everyone if w["role"] == "qc"),
-        brands=brand_suggestions(),
+        ADMIN, name=me["name"],
+        rows=engine.admin_overview(me["id"]),
+        totals=engine.totals(me["id"]),
+        workers=[p for p in team if p["role"] == ROLE_WORKER],
+        qcs=[p for p in team if p["role"] == ROLE_QC],
+        team=_team_rows(me, team),
+        n_workers=sum(1 for p in team if p["role"] == ROLE_WORKER),
+        n_qc=sum(1 for p in team if p["role"] == ROLE_QC),
+        n_admins=sum(1 for p in team if p["role"] == ROLE_ADMIN),
+        brands=brands, avail=avail, avail_stale=avail_stale,
         today=today.isoformat(),
         month_start=today.replace(day=1).isoformat(),
         notes=engine.unread_notifications(session.get("login")),
         msgs=_pop_flash())
+
+
+@app.route("/admin/brand-counts")
+@admin_required
+def brand_counts():
+    """Photos still free to assign, per brand. The admin page fetches this
+    after it loads, because counting can take S3 a few seconds."""
+    counts, _ = engine.brand_availability(brand_suggestions())
+    return jsonify({"counts": counts})
 
 
 @app.route("/admin/report")
@@ -595,7 +745,7 @@ def admin_report():
         _flash("Report: the 'To' date must be on or after 'From'.")
         return redirect(url_for("admin"))
 
-    data = engine.report_data(start, end, worker or None)
+    data = engine.report_data(start, end, worker or None, owner_id=g.user["id"])
     if not data["master"]:
         who = f" for {worker}" if worker else ""
         _flash(f"No photos were allotted{who} between {start_s} and {end_s}.")
@@ -617,45 +767,90 @@ def assign():
     brand = request.form.get("brand", "").strip()
     count = (request.form.get("count") or "").strip()
     qc = request.form.get("qc", "").strip()
-    if worker and brand and count.isdigit() and int(count) > 0:
+    if not (worker and brand and count.isdigit() and int(count) > 0):
+        _flash("Fill in worker, brand and a positive number.")
+    elif not _on_team(worker, ROLE_WORKER) or (qc and not _on_team(qc, ROLE_QC)):
+        _flash("Pick the worker (and QC) from your own team.")
+    else:
         res = engine.create_assignment(worker, brand, int(count),
-                                       qc_login=qc or None)
+                                       qc_login=qc or None,
+                                       owner_id=g.user["id"])
         msg = f"Assigned {res['reserved']} photo(s) of {brand} to {res['worker']}."
         if qc:
             msg += f" QC: {qc}."
         if res["short"]:
             msg += f" ({res['short']} short — not enough available.)"
         _flash(msg)
-    else:
-        _flash("Fill in worker, brand and a positive number.")
     return redirect(url_for("admin"))
 
 
 @app.route("/admin/workers", methods=["POST"])
 @admin_required
 def add_worker():
+    """Add a worker, QC or admin to the signed-in admin's team (or update /
+    bring back one of their own people with the same login)."""
     name = request.form.get("name", "").strip()
     login_ = request.form.get("login", "").strip()
     pw = request.form.get("password", "").strip()
-    role = request.form.get("role", "worker").strip().lower()
-    if role not in ("worker", "qc"):
-        role = "worker"
+    role = request.form.get("role", ROLE_WORKER).strip().lower()
+    if role not in (ROLE_WORKER, ROLE_QC, ROLE_ADMIN):
+        role = ROLE_WORKER
     if name and login_ and pw:
-        r = auth.create_user(name, login_, pw, role=role)
-        label = "QC" if r["role"] == "qc" else "worker"
-        _flash(f"{'Updated' if r['updated'] else 'Added'} {label} {r['name']} ({r['login']}).")
+        r = auth.add_person(g.user["id"], name, login_, pw, role=role)
+        if r["taken"]:
+            _flash(f"The login “{r['login']}” is already in use — pick another.")
+        else:
+            label = {ROLE_QC: "QC", ROLE_ADMIN: "admin"}.get(r["role"], "worker")
+            verb = ("Restored" if r["restored"]
+                    else "Updated" if r["updated"] else "Added")
+            _flash(f"{verb} {label} {r['name']} ({r['login']}).")
     else:
         _flash("Name, login and password are all required.")
+    return redirect(url_for("admin"))
+
+
+@app.route("/admin/people/<int:pid>/delete", methods=["POST"])
+@admin_required
+def delete_person(pid):
+    res = engine.remove_person(g.user["id"], pid)
+    if res is None:
+        _flash("You can only delete people on your own team.")
+    else:
+        msg = f"Deleted {res['name']}."
+        if res["released"]:
+            msg += f" {res['released']} unfinished photo(s) went back to the pool."
+        if res["unassigned"]:
+            msg += f" They're no longer QC on {res['unassigned']} batch(es)."
+        if res["moved"]:
+            msg += f" Their {res['moved']} team member(s) are now on your team."
+        _flash(msg)
     return redirect(url_for("admin"))
 
 
 @app.route("/admin/assignment/<int:aid>")
 @admin_required
 def assignment_view(aid):
-    d = engine.assignment_detail(aid)
+    d = engine.assignment_detail(aid) if _my_batch(aid) else None
     if not d:
         return redirect(url_for("admin"))
-    return render_template_string(ASSIGN_DETAIL, name=session.get("name"), d=d)
+    return render_template_string(ASSIGN_DETAIL, name=session.get("name"), d=d,
+                                  msgs=_pop_flash())
+
+
+@app.route("/admin/assignment/<int:aid>/download-zip")
+@admin_required
+def admin_download_zip(aid):
+    """Every finished file in a batch as one zip (streamed from Drive), so the
+    admin doesn't have to open and save them one at a time."""
+    info = engine.finished_files(aid) if _my_batch(aid) else None
+    if info is None:
+        return redirect(url_for("admin"))
+    if not info["files"]:
+        _flash("Nothing to download yet — no finished files in this batch.")
+        return redirect(url_for("assignment_view", aid=aid))
+    tag = re.sub(r"[^A-Za-z0-9_-]+", "-",
+                 f"{info['worker']}_{info['brand']}").strip("-")
+    return _drive_zip(info["files"], f"{tag}_assignment{aid}.zip")
 
 
 @app.route("/admin/assign-qc", methods=["POST"])
@@ -663,7 +858,7 @@ def assignment_view(aid):
 def assign_qc_route():
     aid = request.form.get("assignment_id", "")
     qc = request.form.get("qc", "").strip()
-    if aid.isdigit():
+    if aid.isdigit() and _my_batch(int(aid)) and (not qc or _on_team(qc, ROLE_QC)):
         engine.assign_qc(int(aid), qc or None)
     return redirect(url_for("admin"))
 
@@ -676,6 +871,9 @@ def reassign_worker_route():
     aid = request.form.get("assignment_id", "")
     worker = request.form.get("worker", "").strip()
     if aid.isdigit() and worker:
+        if not (_my_batch(int(aid)) and _on_team(worker, ROLE_WORKER)):
+            _flash("Reassign: pick a batch and a worker from your own team.")
+            return redirect(url_for("admin"))
         res = engine.reassign_remaining(int(aid), worker)
         if res is None:
             _flash("Reassign: that batch no longer exists.")
@@ -723,43 +921,7 @@ def qc_download_zip(aid):
         _flash("Nothing to download yet — the worker hasn't uploaded any "
                "finished files.")
         return redirect(url_for("qc_assignment_view", aid=aid))
-
-    # resolve real Drive names first (keeps extensions), de-duplicating clashes
-    entries, seen = [], {}
-    for it in info["files"]:
-        nm = drive.file_name(it["file_id"], default=it["name"])
-        if nm in seen:
-            seen[nm] += 1
-            root, dot, ext = nm.rpartition(".")
-            nm = f"{root}_{seen[nm]}.{ext}" if dot else f"{nm}_{seen[nm]}"
-        else:
-            seen[nm] = 1
-        entries.append((it["file_id"], nm))
-
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
-    tmp.close()
-    try:
-        with zipfile.ZipFile(tmp.name, "w", zipfile.ZIP_STORED) as zf:
-            for fid, nm in entries:
-                drive.stream_into_zip(zf, fid, nm)
-    except Exception:
-        try:
-            os.remove(tmp.name)
-        except OSError:
-            pass
-        raise
-
-    resp = send_file(tmp.name, as_attachment=True, mimetype="application/zip",
-                     download_name=f"{info['brand']}_assignment{aid}_QC.zip")
-
-    @resp.call_on_close
-    def _cleanup():
-        try:
-            os.remove(tmp.name)
-        except OSError:
-            pass
-
-    return resp
+    return _drive_zip(info["files"], f"{info['brand']}_assignment{aid}_QC.zip")
 
 
 @app.route("/qc/submit-batch/<int:aid>", methods=["POST"])

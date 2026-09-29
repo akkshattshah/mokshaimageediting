@@ -1,6 +1,6 @@
 """The whole state of the platform in three tables.
 
-  workers            - people who log in (one admin, many retouchers)
+  workers            - people who log in (admins, retouchers, QC)
   assignments        - "worker owes N photos of brand X"
   assignment_photos  - one row per assigned photo, tracked through its life
                        (assigned -> downloaded -> uploaded). Verification is
@@ -40,6 +40,15 @@ class Worker(Base):
     role: Mapped[str] = mapped_column(String(20), default=ROLE_WORKER)
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime, default=dt.datetime.utcnow)
+    # the admin who added this person. Each admin's portal only shows their own
+    # people and those people's batches, so separate teams never get mixed up.
+    # Empty for the first admin.
+    owner_id: Mapped[int | None] = mapped_column(
+        ForeignKey("workers.id"), nullable=True)
+    # set when an admin deletes the person: they can't sign in and drop out of
+    # every list, but the row stays so their finished work keeps its name
+    removed_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime, nullable=True)
 
     assignments: Mapped[list["Assignment"]] = relationship(
         back_populates="worker", cascade="all, delete-orphan",
