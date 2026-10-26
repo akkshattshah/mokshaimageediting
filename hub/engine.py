@@ -47,13 +47,13 @@ def claimed_photo_ids(session, brand):
 # process. What's already claimed is counted fresh from the DB on every call, so
 # a new assignment shows up in the numbers straight away.
 _WINDOW_TTL = 600                     # seconds
-_windows = {}           # brand -> (listed_at, [date folders], photos in them)
+_windows = {}           # brand -> (listed_at, [date folders], {photo ids in them})
 _windows_lock = threading.Lock()
 
 
 def _list_windows(brands):
-    """List each brand's newest date folders in S3 and count the photos in
-    them, many folders at once. A brand S3 fails on is skipped (left
+    """List each brand's newest date folders in S3 and collect the photo ids
+    in them, many folders at once. A brand S3 fails on is skipped (left
     uncounted) and retried next time."""
     def dates(b):
         try:
@@ -61,27 +61,28 @@ def _list_windows(brands):
         except Exception:  # noqa
             return b, None
 
-    def count(job):
+    def ids(job):
         try:
-            return job, len(s3source.folder_photo_ids(*job))
+            return job, s3source.pending_photo_ids(*job)
         except Exception:  # noqa
             return job, None
 
     with ThreadPoolExecutor(max_workers=10) as pool:
         found = {b: ds for b, ds in pool.map(dates, brands) if ds is not None}
-        per = dict(pool.map(count, [(b, d) for b, ds in found.items()
-                                    for d in ds]))
+        per = dict(pool.map(ids, [(b, d) for b, ds in found.items()
+                                  for d in ds]))
     now = time.monotonic()
     for b, ds in found.items():
-        ns = [per[(b, d)] for d in ds]
-        if None not in ns:
-            _windows[b] = (now, ds, sum(ns))
+        sets = [per[(b, d)] for d in ds]
+        if None not in sets:
+            _windows[b] = (now, ds, set().union(*sets))
 
 
 def brand_availability(brands, refresh=True):
-    """How many photos of each brand are still free to assign: the ones in the
-    newest date folders create_assignment draws from, minus every photo any
-    batch has already claimed. Returns ({brand: count, or None if not counted
+    """How many photos of each brand are still free to assign: the ones not
+    yet retouched (no finished JPG) in the newest date folders
+    create_assignment draws from, minus every photo any batch has already
+    claimed. Returns ({brand: count, or None if not counted
     yet}, stale) - stale meaning some count is missing or old enough to redo.
     refresh=False never touches S3, so it's instant (for rendering a page)."""
     if refresh:
@@ -93,7 +94,9 @@ def brand_availability(brands, refresh=True):
                 _list_windows(due)
     known = {b: _windows[b] for b in brands if b in _windows}
 
-    # claimed photos inside each brand's window (photo ids start brand/date/)
+    # claimed photos inside each brand's window (photo ids start brand/date/).
+    # Subtracted as a set, exactly as create_assignment excludes them: a photo
+    # in two batches, or one no longer in S3, mustn't be taken off twice.
     conds = [and_(Assignment.brand == b,
                   or_(*[AssignmentPhoto.photo_id.startswith(f"{b}/{d}/",
                                                             autoescape=True)
@@ -102,22 +105,23 @@ def brand_availability(brands, refresh=True):
     claimed = {}
     if conds:
         with SessionLocal() as s:
-            claimed = dict(s.execute(
-                select(Assignment.brand, func.count())
-                .join(AssignmentPhoto,
-                      AssignmentPhoto.assignment_id == Assignment.id)
-                .where(or_(*conds))
-                .group_by(Assignment.brand)).all())
+            for b, pid in s.execute(
+                    select(Assignment.brand, AssignmentPhoto.photo_id)
+                    .distinct()
+                    .join(AssignmentPhoto,
+                          AssignmentPhoto.assignment_id == Assignment.id)
+                    .where(or_(*conds))):
+                claimed.setdefault(b, set()).add(pid)
 
+    # a listing past its TTL (not refreshed yet, or S3 failed the refresh) is
+    # reported as not counted rather than shown as if it were current
     now = time.monotonic()
     counts, stale = {}, False
     for b in brands:
-        if b not in known:
+        if b not in known or now - known[b][0] > _WINDOW_TTL:
             counts[b], stale = None, True
             continue
-        listed_at, _, total = known[b]
-        counts[b] = max(0, total - claimed.get(b, 0))
-        stale = stale or now - listed_at > _WINDOW_TTL
+        counts[b] = len(known[b][2] - claimed.get(b, set()))
     return counts, stale
 
 
