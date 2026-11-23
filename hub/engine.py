@@ -144,6 +144,11 @@ def create_assignment(worker_login, brand, count, qc_login=None, owner_id=None):
             qc_id = qc.id if qc else None
         taken = claimed_photo_ids(s, brand)
         pids = s3source.available_photo_ids(brand, taken, want=count)
+        if not pids:                   # nothing free: don't leave an empty 0/0 batch
+            s.rollback()
+            return {"assignment_id": None, "worker": w.name, "brand": brand,
+                    "requested": count, "reserved": 0, "short": count,
+                    "photo_ids": []}
 
         a = Assignment(worker_id=w.id, qc_id=qc_id, brand=brand, count=count)
         s.add(a)
