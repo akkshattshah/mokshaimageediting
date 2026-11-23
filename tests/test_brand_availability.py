@@ -569,6 +569,49 @@ def test_worker_cannot_download_someone_elses_batch(web):
     assert other.get(f"/me/download-zip/{aid}").status_code == 403
 
 
+# ---- empty batches and the admin timeline --------------------------------
+def test_assigning_when_nothing_is_free_creates_no_batch():
+    put_pairs("b", "20260701", 2)
+    engine.create_assignment("w1", "b", 2)
+    res = engine.create_assignment("w2", "b", 3)
+    assert res["reserved"] == 0 and res["assignment_id"] is None
+    with db.SessionLocal() as s:
+        assert s.query(Assignment).count() == 1      # no empty 0/0 batch
+
+
+def _admin_client(app, auth):
+    auth.create_user("Admin", "admin", "pw", role=ROLE_ADMIN)
+    with db.SessionLocal() as s:
+        admin_id = s.query(Worker).filter_by(login="admin").one().id
+    c = app.test_client()
+    c.post("/login", data={"login": "admin", "password": "pw"})
+    return c, admin_id
+
+
+def _finish_and_approve(aid):
+    with db.SessionLocal() as s:
+        for p in s.query(AssignmentPhoto).filter_by(assignment_id=aid):
+            p.status, p.qc = ST_UPLOADED, "ok"
+        s.commit()
+
+
+def test_timeline_hides_completed_batches_until_asked(web, monkeypatch):
+    app, auth = web
+    monkeypatch.setattr(engine, "brand_availability",
+                        lambda brands, **k: ({b: 0 for b in brands}, False))
+    c, admin_id = _admin_client(app, auth)
+    put_pairs("b", "20260701", 6)
+    done = engine.create_assignment("w1", "b", 2, owner_id=admin_id)["assignment_id"]
+    busy = engine.create_assignment("w1", "b", 2, owner_id=admin_id)["assignment_id"]
+    _finish_and_approve(done)
+    page = c.get("/admin").get_data(as_text=True)
+    assert f"/admin/assignment/{busy}\"" in page
+    assert f"/admin/assignment/{done}\"" not in page
+    assert "1 completed batch hidden" in page
+    page = c.get("/admin?show=all").get_data(as_text=True)
+    assert f"/admin/assignment/{done}\"" in page and f"/admin/assignment/{busy}\"" in page
+
+
 # ---- known defects outside the count, documented not fixed ---------------
 @pytest.mark.xfail(strict=True, reason="create_assignment has no lock or "
                    "unique constraint: two overlapping assigns can reserve "

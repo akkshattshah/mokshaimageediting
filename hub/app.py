@@ -208,7 +208,10 @@ ADMIN = STYLE + """
 
   <div class="card">
     <h2>Timeline</h2>
-    {% if not rows %}<p class="muted">No assignments yet.</p>{% else %}
+    {% if n_hidden %}<p class="muted" style="font-size:13px;margin-top:-4px">
+      {% if show_all %}Showing all batches · <a href="{{url_for('admin')}}">hide {{n_hidden}} completed</a>
+      {% else %}{{n_hidden}} completed batch{{'es' if n_hidden != 1 else ''}} hidden · <a href="{{url_for('admin', show='all')}}">show completed</a>{% endif %}</p>{% endif %}
+    {% if not rows %}<p class="muted">{{ 'Nothing in progress - every batch is completed.' if n_hidden else 'No assignments yet.' }}</p>{% else %}
     <div class="legend">
       <span>newest first ·</span>
       <span><i style="background:var(--good)"></i>done</span>
@@ -701,9 +704,16 @@ def admin():
     brands = brand_suggestions()
     avail, avail_stale = engine.brand_availability(brands, refresh=False)
     today = dt.date.today()
+    # Finished batches (QC done) and empty ones are hidden unless asked for,
+    # so the timeline shows what still needs attention. Nothing is deleted.
+    rows = engine.admin_overview(me["id"])
+    show_all = request.args.get("show") == "all"
+    n_hidden = sum(1 for r in rows if r["stage"] in ("complete", "empty"))
+    if not show_all:
+        rows = [r for r in rows if r["stage"] not in ("complete", "empty")]
     return render_template_string(
         ADMIN, name=me["name"],
-        rows=engine.admin_overview(me["id"]),
+        rows=rows, show_all=show_all, n_hidden=n_hidden,
         totals=engine.totals(me["id"]),
         workers=[p for p in team if p["role"] == ROLE_WORKER],
         qcs=[p for p in team if p["role"] == ROLE_QC],
@@ -776,6 +786,9 @@ def assign():
         res = engine.create_assignment(worker, brand, int(count),
                                        qc_login=qc or None,
                                        owner_id=g.user["id"])
+        if not res["reserved"]:
+            _flash(f"No photos of {brand} are free right now - nothing was assigned.")
+            return redirect(url_for("admin"))
         msg = f"Assigned {res['reserved']} photo(s) of {brand} to {res['worker']}."
         if qc:
             msg += f" QC: {qc}."
