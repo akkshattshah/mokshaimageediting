@@ -12,7 +12,8 @@ import tempfile
 import zipfile
 
 from flask import (Flask, request, session, redirect, url_for, g,
-                   render_template_string, flash, abort, jsonify, send_file)
+                   render_template_string, flash, abort, jsonify, send_file,
+                   Response, stream_with_context)
 
 from .db import init_db
 from . import engine, auth, s3source, drive, report
@@ -996,8 +997,9 @@ def me():
 @login_required
 def me_download_zip(aid):
     """Stream every not-yet-finished photo in this assignment as ONE zip
-    (image + PSD, in folders). Files come from S3 through the server only for
-    the moment it takes to zip them. Marks them downloaded on success."""
+    (image + PSD, in folders). The zip is sent while it's being built, so the
+    download starts at once. Marks the photos downloaded only after the whole
+    zip has gone out (an interrupted download leaves them as they were)."""
     if engine.assignment_owner_login(aid) != session.get("login"):
         abort(403)
     detail = engine.assignment_detail(aid)
@@ -1006,32 +1008,13 @@ def me_download_zip(aid):
     if not pids:
         abort(404)
 
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
-    tmp.close()
-    try:
-        with zipfile.ZipFile(tmp.name, "w", zipfile.ZIP_STORED) as zf:
-            for pid in pids:
-                for key in s3source.files_for_photo(pid):
-                    s3source.fetch_into_zip(zf, key, s3source.local_pid(key))
-    except Exception:
-        try:
-            os.remove(tmp.name)
-        except OSError:
-            pass
-        raise
-    engine.mark_downloaded(aid, pids)
+    def body():
+        yield from s3source.zip_photos(pids)
+        engine.mark_downloaded(aid, pids)
 
-    resp = send_file(tmp.name, as_attachment=True, mimetype="application/zip",
-                     download_name=f"{detail['brand']}_assignment{aid}.zip")
-
-    @resp.call_on_close
-    def _cleanup():
-        try:
-            os.remove(tmp.name)
-        except OSError:
-            pass
-
-    return resp
+    name = f"{detail['brand']}_assignment{aid}.zip"
+    return Response(stream_with_context(body()), mimetype="application/zip",
+                    headers={"Content-Disposition": f'attachment; filename="{name}"'})
 
 
 @app.route("/me/upload-one/<int:aid>", methods=["POST"])
