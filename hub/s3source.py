@@ -8,6 +8,7 @@ picks up either automatically.
 import datetime as dt
 import os
 import re
+import zipfile
 
 import boto3
 
@@ -118,6 +119,44 @@ def fetch_into_zip(zipf, key, arcname):
     with zipf.open(arcname, "w") as dest:
         for chunk in obj["Body"].iter_chunks(1024 * 1024):
             dest.write(chunk)
+
+
+class _ZipSink:
+    """Write-only output for zipfile (it handles unseekable output) that keeps
+    what was written until zip_photos hands it on."""
+
+    def __init__(self):
+        self._parts = []
+
+    def write(self, data):
+        self._parts.append(bytes(data))
+        return len(data)
+
+    def flush(self):
+        pass
+
+    def drain(self):
+        if self._parts:
+            data = b"".join(self._parts)
+            self._parts.clear()
+            yield data
+
+
+def zip_photos(photo_ids, chunk=1024 * 1024):
+    """One zip of these photos' files (kept in their folders, pool-relative),
+    yielded piece by piece as each part is read from S3 - so a download can
+    start at once instead of after the whole zip is built."""
+    sink = _ZipSink()
+    with zipfile.ZipFile(sink, "w", zipfile.ZIP_STORED) as zf:
+        for pid in photo_ids:
+            for key in files_for_photo(pid):
+                body = _s3.get_object(Bucket=BUCKET, Key=key)["Body"]
+                with zf.open(local_pid(key), "w") as dest:
+                    for part in body.iter_chunks(chunk):
+                        dest.write(part)
+                        yield from sink.drain()
+                yield from sink.drain()
+    yield from sink.drain()            # the zip's closing directory
 
 
 def folder_photo_ids(brand, date):

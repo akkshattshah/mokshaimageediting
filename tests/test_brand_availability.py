@@ -42,6 +42,20 @@ class FakeS3:
     def __init__(self):
         self.keys = set()
         self.fail = False
+        self.reads = []                   # keys fetched with get_object
+
+    def get_object(self, Bucket, Key):
+        if Key not in self.keys:
+            raise KeyError(Key)
+        self.reads.append(Key)
+        data = (f"<{Key}>" * 40).encode()
+
+        class _Body:
+            def iter_chunks(self, size):
+                for i in range(0, len(data), size):
+                    yield data[i:i + size]
+
+        return {"Body": _Body()}
 
     def list_objects_v2(self, Bucket, Prefix="", Delimiter=None,
                         MaxKeys=1000, ContinuationToken=None, **_):
@@ -119,6 +133,7 @@ def teardown_module():
 def clean_state():
     FAKE_S3.keys.clear()
     FAKE_S3.fail = False
+    FAKE_S3.reads.clear()
     engine._windows.clear()
     with db.engine.begin() as c:
         for t in reversed(db.Base.metadata.sorted_tables):
@@ -464,6 +479,94 @@ def test_completion_check_can_be_disabled(monkeypatch):
     finish("b", "20260701", "car-000")
     monkeypatch.setattr(s3source, "DONE_BASE", "")
     assert shown("b") == assignable("b") == 3
+
+
+# ---- worker zip download (streamed) --------------------------------------
+def _unzip(data):
+    import io
+    import zipfile
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
+        return {n: z.read(n) for n in z.namelist()}
+
+
+def test_zip_holds_each_photos_files_in_their_folders():
+    put("b/20260701/x/car-1.psd", "b/20260701/x/car-1_orig.jpg",
+        "b/20260701/x/car-10.psd", "b/20260701/y/car-2.psd",
+        "b/20260701/y/car-2_orig.webp")
+    files = _unzip(b"".join(s3source.zip_photos(
+        ["b/20260701/x/car-1", "b/20260701/y/car-2"])))
+    assert sorted(files) == ["b/20260701/x/car-1.psd", "b/20260701/x/car-1_orig.jpg",
+                             "b/20260701/y/car-2.psd", "b/20260701/y/car-2_orig.webp"]
+    for name, data in files.items():
+        assert data == (f"<{BASE}{name}>" * 40).encode()
+
+
+def test_zip_starts_before_the_rest_of_the_files_are_read():
+    """The download must start at once, not after every file is fetched."""
+    put_pairs("b", "20260701", 5)
+    gen = s3source.zip_photos([f"b/20260701/ext/car-{i:03d}" for i in range(5)],
+                              chunk=64)
+    first = next(gen)
+    assert first and len(FAKE_S3.reads) == 1      # 1 of 10 files read so far
+    rest = b"".join(gen)
+    assert len(FAKE_S3.reads) == 10
+    assert len(_unzip(first + rest)) == 10
+
+
+@pytest.fixture
+def web():
+    """hub.app with Drive and the Excel report stubbed out (not used here)."""
+    for name in ("drive", "report"):
+        sys.modules.setdefault(f"hub.{name}", types.ModuleType(f"hub.{name}"))
+    from hub import app as webapp, auth
+    return webapp.app, auth
+
+
+def _worker_client(app, auth, login="w1"):
+    auth.create_user("W One", login, "pw")
+    c = app.test_client()
+    c.post("/login", data={"login": login, "password": "pw"})
+    return c
+
+
+def _statuses(aid):
+    with db.SessionLocal() as s:
+        return sorted(p.status for p in s.query(AssignmentPhoto).filter_by(assignment_id=aid))
+
+
+def test_worker_download_streams_and_marks_downloaded_only_at_the_end(web):
+    app, auth = web
+    put_pairs("b", "20260701", 3)
+    c = _worker_client(app, auth)
+    aid = engine.create_assignment("w1", "b", 3)["assignment_id"]
+    resp = c.get(f"/me/download-zip/{aid}")
+    assert resp.status_code == 200 and resp.mimetype == "application/zip"
+    assert "b_assignment" in resp.headers["Content-Disposition"]
+    assert "Content-Length" not in resp.headers           # streamed, not prebuilt
+    assert _statuses(aid) == ["assigned"] * 3              # nothing sent yet
+    files = _unzip(resp.get_data())
+    assert len(files) == 6
+    assert _statuses(aid) == ["downloaded"] * 3
+
+
+def test_interrupted_worker_download_leaves_photos_as_they_were(web):
+    app, auth = web
+    put_pairs("b", "20260701", 3)
+    c = _worker_client(app, auth)
+    aid = engine.create_assignment("w1", "b", 3)["assignment_id"]
+    resp = c.get(f"/me/download-zip/{aid}")
+    next(iter(resp.response))                             # first piece only
+    resp.close()                                          # browser gave up
+    assert _statuses(aid) == ["assigned"] * 3
+
+
+def test_worker_cannot_download_someone_elses_batch(web):
+    app, auth = web
+    put_pairs("b", "20260701", 2)
+    _worker_client(app, auth, "w1")
+    other = _worker_client(app, auth, "w2")
+    aid = engine.create_assignment("w1", "b", 2)["assignment_id"]
+    assert other.get(f"/me/download-zip/{aid}").status_code == 403
 
 
 # ---- known defects outside the count, documented not fixed ---------------
