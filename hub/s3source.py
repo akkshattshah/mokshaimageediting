@@ -8,9 +8,12 @@ picks up either automatically.
 import datetime as dt
 import os
 import re
+import tempfile
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 
 import boto3
+from botocore.config import Config
 
 REGION = os.environ.get("AWS_REGION", "ap-south-1")
 BUCKET = os.environ.get("S3_BUCKET", "carcutter-mumbai")
@@ -24,7 +27,12 @@ DONE_BASE = os.environ.get("S3_DONE_PREFIX", "upload-retouching-jpg/")
 IMG_EXTS = (".psd", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp")
 MAX_DATES = 8      # assignments draw from a brand's newest this-many date folders
 
-_s3 = boto3.client("s3", region_name=REGION)
+# On Railway a read from S3 can freeze mid-file with no error. Give up on a
+# silent connection after 20 s (default 60 s) so it can be retried, and keep
+# connections alive with TCP keepalives.
+_s3 = boto3.client("s3", region_name=REGION, config=Config(
+    connect_timeout=10, read_timeout=20, tcp_keepalive=True,
+    retries={"max_attempts": 5, "mode": "standard"}))
 _pag = _s3.get_paginator("list_objects_v2")
 
 
@@ -142,21 +150,57 @@ class _ZipSink:
             yield data
 
 
+FETCH_TRIES = 3
+
+
+def _fetch(key, chunk):
+    """The whole S3 object in a temp file (memory, then disk past 8 MB).
+    Fetched in full before any of it is sent, so S3 is never left waiting on
+    a slow browser, and a read that freezes or breaks is simply started over
+    (up to FETCH_TRIES times) - nothing of this file has been sent yet."""
+    for attempt in range(1, FETCH_TRIES + 1):
+        tmp = tempfile.SpooledTemporaryFile(max_size=8 * 1024 * 1024)
+        try:
+            body = _s3.get_object(Bucket=BUCKET, Key=key)["Body"]
+            for part in body.iter_chunks(chunk):
+                tmp.write(part)
+            tmp.seek(0)
+            return tmp
+        except Exception:
+            tmp.close()
+            if attempt == FETCH_TRIES:
+                raise
+
+
 def zip_photos(photo_ids, chunk=1024 * 1024):
     """One zip of these photos' files (kept in their folders, pool-relative),
-    yielded piece by piece as each part is read from S3 - so a download can
-    start at once instead of after the whole zip is built."""
+    yielded file by file as each is fetched from S3 - so a download starts
+    after the first file instead of after the whole zip is built. The next
+    file is fetched in the background while the current one is being sent."""
+    keys = (k for pid in photo_ids for k in files_for_photo(pid))
     sink = _ZipSink()
-    with zipfile.ZipFile(sink, "w", zipfile.ZIP_STORED) as zf:
-        for pid in photo_ids:
-            for key in files_for_photo(pid):
-                body = _s3.get_object(Bucket=BUCKET, Key=key)["Body"]
-                with zf.open(local_pid(key), "w") as dest:
-                    for part in body.iter_chunks(chunk):
+    pool = ThreadPoolExecutor(max_workers=1)
+    key = next(keys, None)
+    pending = pool.submit(_fetch, key, chunk) if key else None
+    try:
+        with zipfile.ZipFile(sink, "w", zipfile.ZIP_STORED) as zf:
+            while pending:
+                src, name = pending.result(), local_pid(key)
+                key = next(keys, None)
+                pending = pool.submit(_fetch, key, chunk) if key else None
+                with src, zf.open(name, "w") as dest:
+                    while part := src.read(chunk):
                         dest.write(part)
                         yield from sink.drain()
                 yield from sink.drain()
-    yield from sink.drain()            # the zip's closing directory
+        yield from sink.drain()        # the zip's closing directory
+    finally:                           # download finished or browser gave up
+        if pending:
+            try:
+                pending.result().close()
+            except Exception:
+                pass
+        pool.shutdown(wait=False)
 
 
 def folder_photo_ids(brand, date):
