@@ -43,17 +43,23 @@ class FakeS3:
         self.keys = set()
         self.fail = False
         self.reads = []                   # keys fetched with get_object
+        self.breaks = {}                  # key -> reads that break mid-file
 
     def get_object(self, Bucket, Key):
         if Key not in self.keys:
             raise KeyError(Key)
         self.reads.append(Key)
         data = (f"<{Key}>" * 40).encode()
+        broken = self.breaks.get(Key, 0) > 0
+        if broken:
+            self.breaks[Key] -= 1
 
         class _Body:
             def iter_chunks(self, size):
                 for i in range(0, len(data), size):
                     yield data[i:i + size]
+                    if broken:            # like a read that froze and timed out
+                        raise ConnectionError("simulated frozen S3 read")
 
         return {"Body": _Body()}
 
@@ -134,6 +140,7 @@ def clean_state():
     FAKE_S3.keys.clear()
     FAKE_S3.fail = False
     FAKE_S3.reads.clear()
+    FAKE_S3.breaks.clear()
     engine._windows.clear()
     with db.engine.begin() as c:
         for t in reversed(db.Base.metadata.sorted_tables):
@@ -507,10 +514,31 @@ def test_zip_starts_before_the_rest_of_the_files_are_read():
     gen = s3source.zip_photos([f"b/20260701/ext/car-{i:03d}" for i in range(5)],
                               chunk=64)
     first = next(gen)
-    assert first and len(FAKE_S3.reads) == 1      # 1 of 10 files read so far
+    assert first and len(FAKE_S3.reads) <= 2      # file 1 sent, file 2 being fetched
     rest = b"".join(gen)
     assert len(FAKE_S3.reads) == 10
     assert len(_unzip(first + rest)) == 10
+
+
+def test_a_frozen_s3_read_is_retried_and_the_zip_stays_complete():
+    put_pairs("b", "20260701", 2)
+    pids = [f"b/20260701/ext/car-{i:03d}" for i in range(2)]
+    key = f"{BASE}b/20260701/ext/car-001.psd"
+    FAKE_S3.breaks[key] = 2                       # fails twice, works on try 3
+    files = _unzip(b"".join(s3source.zip_photos(pids, chunk=16)))
+    assert len(files) == 4
+    for name, data in files.items():              # every file whole, no half copy
+        assert data == (f"<{BASE}{name}>" * 40).encode()
+    assert FAKE_S3.reads.count(key) == 3
+
+
+def test_a_file_that_keeps_failing_stops_the_download():
+    put_pairs("b", "20260701", 1)
+    key = f"{BASE}b/20260701/ext/car-000.psd"
+    FAKE_S3.breaks[key] = 99
+    with pytest.raises(ConnectionError):
+        b"".join(s3source.zip_photos(["b/20260701/ext/car-000"], chunk=16))
+    assert FAKE_S3.reads.count(key) == s3source.FETCH_TRIES
 
 
 @pytest.fixture
