@@ -14,6 +14,7 @@ import zipfile
 from flask import (Flask, request, session, redirect, url_for, g,
                    render_template_string, flash, abort, jsonify, send_file,
                    Response, stream_with_context)
+from werkzeug.http import http_date
 
 from .db import init_db
 from . import engine, auth, s3source, drive, report
@@ -341,6 +342,8 @@ WORKER = STYLE + """
             {% else %}
               <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
                 <a class="dlbtn" href="/me/download-zip/{{a.assignment_id}}">⬇ Download {{a.remaining}}</a>
+                <button class="dlbtn fastbtn" onclick="fastdl({{a.assignment_id}}, this)"
+                        title="Each file straight from storage - faster on slow internet, no zip">⚡ Download files (fast)</button>
                 <button class="upbtn" onclick="document.getElementById('f{{a.assignment_id}}').click()">⬆ Upload finished</button>
                 <input type="file" id="f{{a.assignment_id}}" multiple style="display:none"
                        onchange="up({{a.assignment_id}}, this)">
@@ -352,7 +355,8 @@ WORKER = STYLE + """
       </tr>
       {% endfor %}
     </table>
-    <p class="muted" style="font-size:12px;margin-top:14px">Download the zip, retouch, then <b>Upload finished</b> and pick your finished files. Each finished file is matched to its photo by name — anything you still owe stays under “left”, and your admin sees the same.</p>
+    <p class="muted" style="font-size:12px;margin-top:14px"><b>Download</b> gives one zip; if it stops, click <b>Resume</b> in your browser's downloads (Ctrl+J). Slow internet or a big batch? Use <b>Download files (fast)</b>: the same files, one by one, straight to your Downloads folder (the first time, the browser asks to allow multiple downloads - click Allow).</p>
+    <p class="muted" style="font-size:12px;margin-top:6px">Then retouch, click <b>Upload finished</b> and pick your finished files. Each finished file is matched to its photo by name — anything you still owe stays under “left”, and your admin sees the same.</p>
     {% endif %}
   </div>
 
@@ -393,11 +397,51 @@ WORKER = STYLE + """
 <style>.dlbtn,.upbtn{display:inline-block;padding:7px 14px;border-radius:8px;font-size:13px;border:0;cursor:pointer}
 .dlbtn{background:var(--accent);color:#fff;text-decoration:none}
 .upbtn{background:var(--good);color:#fff}
+.fastbtn{background:#5b4bc4}
+.fastbtn:disabled{opacity:.6;cursor:wait}
 .cgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:12px;margin-top:12px}
 .ctile{border:1px solid var(--line);border-radius:10px;overflow:hidden;background:var(--card)}
 .ctile img{width:100%;height:130px;object-fit:cover;display:block;background:var(--line);cursor:zoom-in}
 .cph{height:130px;display:grid;place-items:center;color:var(--muted);font-size:12px;background:var(--card)}</style>
 <script>
+async function fastdl(aid, btn){
+  const box = document.getElementById('msg' + aid);
+  btn.disabled = true;
+  box.textContent = 'Getting your files…';
+  try{
+    const r = await fetch('/me/download-links/' + aid);
+    if(!r.ok) throw new Error(r.status);
+    const files = (await r.json()).files;
+    const start = f => {
+      const a = document.createElement('a');
+      a.href = f.url; a.rel = 'noopener'; a.style.display = 'none';
+      document.body.appendChild(a); a.click(); a.remove();
+    };
+    const wait = ms => new Promise(res => setTimeout(res, ms));
+    let i = 0;
+    // First time in this browser: the browser asks "download multiple files?"
+    // and drops files requested while it asks. So start 2, wait for the worker
+    // to answer, then go on - repeating file 2 in case it was dropped.
+    if(!localStorage.getItem('fastdl-allowed') && files.length > 1){
+      start(files[0]); await wait(800); start(files[1]);
+      box.innerHTML = '<b>First time only:</b> if the browser asks to download multiple files, ' +
+        'click <b>Allow</b> there, then click <button id="go' + aid + '">Continue</button>';
+      await new Promise(res => document.getElementById('go' + aid).onclick = res);
+      localStorage.setItem('fastdl-allowed', '1');
+      i = 1;
+    }
+    for(; i < files.length; i++){
+      box.textContent = 'Starting file ' + (i + 1) + ' of ' + files.length + '…';
+      start(files[i]);
+      await wait(800);
+    }
+    box.textContent = 'All ' + files.length + ' files started - watch them in your browser downloads (Ctrl+J). ' +
+      'If one fails there, click Retry / Resume on it. (A file saved twice as "… (1)" can be deleted.)';
+  }catch(e){
+    box.textContent = 'Could not start the fast download - please try again, or use Download (zip).';
+  }
+  btn.disabled = false;
+}
 async function up(aid, input){
   const files = Array.from(input.files); input.value = '';
   if(!files.length) return;
@@ -1011,23 +1055,92 @@ def me():
 def me_download_zip(aid):
     """Stream every not-yet-finished photo in this assignment as ONE zip
     (image + PSD, in folders). The zip is sent while it's being built, so the
-    download starts at once. Marks the photos downloaded only after the whole
+    download starts at once, and a broken download can be resumed from where
+    it stopped. Marks the photos downloaded only after the last byte of the
     zip has gone out (an interrupted download leaves them as they were)."""
     if engine.assignment_owner_login(aid) != session.get("login"):
         abort(403)
     detail = engine.assignment_detail(aid)
-    pids = (engine.assignment_photo_ids(aid, ST_ASSIGNED)
-            + engine.assignment_photo_ids(aid, ST_DOWNLOADED))
+    pids = sorted(set(engine.assignment_photo_ids(aid, ST_ASSIGNED)
+                      + engine.assignment_photo_ids(aid, ST_DOWNLOADED)))
     if not pids:
         abort(404)
+    name = f"{detail['brand']}_assignment{aid}.zip"
+    headers = {"Content-Disposition": f'attachment; filename="{name}"'}
+
+    plan = s3source.zip_plan(pids)
+    if plan is None:                   # over 4 GB: plain stream, no resume
+        def body():
+            yield from s3source.zip_photos(pids)
+            engine.mark_downloaded(aid, pids)
+        return Response(stream_with_context(body()), mimetype="application/zip",
+                        headers=headers)
+
+    # Resumable: the zip's size and layout are fixed in advance, so a
+    # browser whose download broke can ask for the rest (Range: bytes=N-)
+    # and continue where it stopped. If-Range makes sure it is still the
+    # same zip (same photos, same files); otherwise it gets the whole zip.
+    total, status = plan.size, 200
+    start, end = 0, total - 1
+    modified = http_date(plan.modified) if plan.modified else None
+    if_range = request.headers.get("If-Range", "").strip()
+    rng = request.headers.get("Range", "")
+    if rng and (not if_range or if_range in (plan.etag, modified)):
+        wanted = _byte_range(rng, total)
+        if wanted is None:
+            return Response(status=416, headers={"Content-Range": f"bytes */{total}"})
+        if wanted != (0, total - 1):
+            start, end = wanted
+            status = 206
+            headers["Content-Range"] = f"bytes {start}-{end}/{total}"
+    headers.update({"Accept-Ranges": "bytes", "ETag": plan.etag,
+                    "Content-Length": str(end - start + 1)})
+    if modified:
+        headers["Last-Modified"] = modified
 
     def body():
-        yield from s3source.zip_photos(pids)
-        engine.mark_downloaded(aid, pids)
+        yield from plan.stream(start, end, engine.crc_cache)
+        if end == total - 1:           # the worker now has the whole zip
+            engine.mark_downloaded(aid, pids)
 
-    name = f"{detail['brand']}_assignment{aid}.zip"
-    return Response(stream_with_context(body()), mimetype="application/zip",
-                    headers={"Content-Disposition": f'attachment; filename="{name}"'})
+    return Response(stream_with_context(body()), status=status,
+                    mimetype="application/zip", headers=headers)
+
+
+@app.route("/me/download-links/<int:aid>")
+@login_required
+def me_download_links(aid):
+    """The fast download: a direct S3 link per file of the photos still to do
+    (the same files the zip holds), which the page then downloads one by one.
+    The files don't pass through this server, so they can't be cut off by the
+    hosting's time limit. Photos are marked downloaded when the links are
+    handed out (the browser doesn't report back when each file finishes)."""
+    if engine.assignment_owner_login(aid) != session.get("login"):
+        abort(403)
+    pids = sorted(set(engine.assignment_photo_ids(aid, ST_ASSIGNED)
+                      + engine.assignment_photo_ids(aid, ST_DOWNLOADED)))
+    if not pids:
+        abort(404)
+    files = s3source.download_links(pids)
+    engine.mark_downloaded(aid, pids)
+    return jsonify({"files": files})
+
+
+def _byte_range(header, total):
+    """(start, end) for a single 'bytes=a-b', 'bytes=a-' or 'bytes=-n' Range,
+    or None if it can't be served. Several ranges at once: the whole zip."""
+    m = re.fullmatch(r"\s*bytes\s*=\s*(\d*)\s*-\s*(\d*)\s*", header)
+    if not m:
+        return (0, total - 1) if "," in header else None
+    a, b = m.groups()
+    if not a and not b:
+        return None
+    if not a:                          # the last n bytes
+        n = int(b)
+        return (max(total - n, 0), total - 1) if n else None
+    start = int(a)
+    end = min(int(b), total - 1) if b else total - 1
+    return (start, end) if start <= end and start < total else None
 
 
 @app.route("/me/upload-one/<int:aid>", methods=["POST"])

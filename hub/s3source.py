@@ -6,10 +6,13 @@ picks up either automatically.
 """
 
 import datetime as dt
+import hashlib
 import os
 import re
+import struct
 import tempfile
 import zipfile
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 
 import boto3
@@ -99,9 +102,16 @@ def files_for_photo(photo_id):
     so do other photos whose names merely start with it ('car-1' / 'car-10'),
     so only keys whose own photo id is this one are kept. Paginated: those
     other photos can push this one's files past the first 1000 keys."""
+    return [o["Key"] for o in photo_files(photo_id)]
+
+
+def photo_files(photo_id):
+    """files_for_photo, with each file's S3 listing entry (Key, Size, ETag,
+    LastModified)."""
     prefix = BASE + photo_id
-    return [o["Key"]
-            for page in _pag.paginate(Bucket=BUCKET, Prefix=prefix)
+    return [o
+            for page in _s3.get_paginator("list_objects_v2").paginate(
+                Bucket=BUCKET, Prefix=prefix)
             for o in page.get("Contents", [])
             if not o["Key"].endswith("/")
             and o["Key"].lower().endswith(IMG_EXTS)
@@ -157,15 +167,19 @@ def _fetch(key, chunk):
     """The whole S3 object in a temp file (memory, then disk past 8 MB).
     Fetched in full before any of it is sent, so S3 is never left waiting on
     a slow browser, and a read that freezes or breaks is simply started over
-    (up to FETCH_TRIES times) - nothing of this file has been sent yet."""
+    (up to FETCH_TRIES times) - nothing of this file has been sent yet.
+    Returns (temp file, CRC-32, size)."""
     for attempt in range(1, FETCH_TRIES + 1):
         tmp = tempfile.SpooledTemporaryFile(max_size=8 * 1024 * 1024)
         try:
             body = _s3.get_object(Bucket=BUCKET, Key=key)["Body"]
+            crc = size = 0
             for part in body.iter_chunks(chunk):
                 tmp.write(part)
+                crc = zlib.crc32(part, crc)
+                size += len(part)
             tmp.seek(0)
-            return tmp
+            return tmp, crc, size
         except Exception:
             tmp.close()
             if attempt == FETCH_TRIES:
@@ -185,7 +199,7 @@ def zip_photos(photo_ids, chunk=1024 * 1024):
     try:
         with zipfile.ZipFile(sink, "w", zipfile.ZIP_STORED) as zf:
             while pending:
-                src, name = pending.result(), local_pid(key)
+                src, name = pending.result()[0], local_pid(key)
                 key = next(keys, None)
                 pending = pool.submit(_fetch, key, chunk) if key else None
                 with src, zf.open(name, "w") as dest:
@@ -197,10 +211,170 @@ def zip_photos(photo_ids, chunk=1024 * 1024):
     finally:                           # download finished or browser gave up
         if pending:
             try:
-                pending.result().close()
+                pending.result()[0].close()
             except Exception:
                 pass
         pool.shutdown(wait=False)
+
+
+# ---- resumable zip --------------------------------------------------------
+# A plain (stored, uncompressed) zip whose every byte position is worked out
+# from the file names and sizes before anything is sent. So the same batch
+# always gives byte-for-byte the same zip, and a browser that lost the
+# connection can ask for "the rest, from byte N" (an HTTP Range request) and
+# continue instead of starting over. Each file's CRC-32 goes in its header;
+# it is computed when the file is read and remembered (crc_cache) for the
+# zip's closing directory and for later resumes.
+
+_LOCAL = struct.Struct("<IHHHHHIIIHH")           # local file header, 30 bytes
+_CENTRAL = struct.Struct("<IHHHHHHIIIHHHHHII")   # central directory entry, 46
+_END = struct.Struct("<IHHHHIIH")                # end of central directory, 22
+_ZIP32_MAX = 0xFFFFFFFF
+
+
+def _dos_time(when):
+    when = max(when, dt.datetime(1980, 1, 1, tzinfo=when.tzinfo))
+    return (when.hour << 11 | when.minute << 5 | when.second // 2,
+            (when.year - 1980) << 9 | when.month << 5 | when.day)
+
+
+class _Entry:
+    def __init__(self, obj, offset):
+        self.key, self.size = obj["Key"], obj["Size"]
+        self.etag = str(obj.get("ETag", "")).strip('"')
+        self.name = local_pid(self.key).encode("utf-8")
+        self.flags = 0 if self.name.isascii() else 0x800      # UTF-8 name
+        self.time, self.date = _dos_time(obj["LastModified"])
+        self.modified = obj["LastModified"]
+        self.offset = offset                                  # local header
+        self.data = offset + _LOCAL.size + len(self.name)     # first data byte
+        self.end = self.data + self.size                      # one past last
+
+    def local_header(self, crc):
+        return _LOCAL.pack(0x04034B50, 20, self.flags, 0, self.time, self.date,
+                           crc, self.size, self.size, len(self.name), 0) + self.name
+
+    def central(self, crc):
+        return _CENTRAL.pack(0x02014B50, 20, 20, self.flags, 0, self.time,
+                             self.date, crc, self.size, self.size, len(self.name),
+                             0, 0, 0, 0, 0, self.offset) + self.name
+
+
+class ZipPlan:
+    """The exact layout of the zip for a list of photos."""
+
+    def __init__(self, objs):
+        self.entries, pos = [], 0
+        for o in objs:
+            e = _Entry(o, pos)
+            self.entries.append(e)
+            pos = e.end
+        self.cd_offset = pos
+        self.cd_size = sum(_CENTRAL.size + len(e.name) for e in self.entries)
+        self.size = self.cd_offset + self.cd_size + _END.size
+        sig = hashlib.sha1(b"zip-v1")
+        for e in self.entries:
+            sig.update(f"{e.key}|{e.size}|{e.etag}|{e.modified.isoformat()}\n".encode())
+        self.etag = f'"{sig.hexdigest()}"'
+        self.modified = max((e.modified for e in self.entries), default=None)
+
+    @property
+    def fits_zip32(self):
+        return self.size < _ZIP32_MAX and len(self.entries) < 0xFFFF
+
+    def stream(self, start, end, cache, chunk=1024 * 1024):
+        """Bytes start..end (inclusive) of the zip. Files that overlap the
+        range are read from S3 whole (with retries); the next one is fetched
+        in the background while the current one is sent."""
+        todo = [e for e in self.entries if e.end > start and e.offset <= end]
+        crcs = {}
+        pool = ThreadPoolExecutor(max_workers=1)
+        it = iter(todo)
+        cur = next(it, None)
+        pending = pool.submit(_fetch, cur.key, chunk) if cur else None
+        try:
+            while pending:
+                src, crc, size = pending.result()
+                e = cur
+                cur = next(it, None)
+                pending = pool.submit(_fetch, cur.key, chunk) if cur else None
+                with src:
+                    if size != e.size:
+                        raise RuntimeError(f"{e.key} changed in S3 during the download")
+                    crcs[e.key] = crc
+                    cache.put(e.key, e.etag, e.size, crc)
+                    yield from _part(e.local_header(crc), e.offset, start, end)
+                    a, b = max(start, e.data), min(end + 1, e.end)
+                    if a < b:
+                        src.seek(a - e.data)
+                        left = b - a
+                        while left:
+                            part = src.read(min(chunk, left))
+                            if not part:
+                                raise RuntimeError(f"{e.key} came back short")
+                            left -= len(part)
+                            yield part
+            if end >= self.cd_offset:
+                yield from _part(self._directory(crcs, cache, chunk),
+                                 self.cd_offset, start, end)
+        finally:
+            if pending:
+                try:
+                    pending.result()[0].close()
+                except Exception:
+                    pass
+            pool.shutdown(wait=False)
+
+    def _directory(self, crcs, cache, chunk):
+        cd = []
+        for e in self.entries:
+            crc = crcs.get(e.key)
+            if crc is None:
+                crc = cache.get(e.key, e.etag, e.size)
+            if crc is None:                  # not remembered: read it once more
+                src, crc, size = _fetch(e.key, chunk)
+                src.close()
+                if size != e.size:
+                    raise RuntimeError(f"{e.key} changed in S3 during the download")
+                cache.put(e.key, e.etag, e.size, crc)
+            cd.append(e.central(crc))
+        cd = b"".join(cd)
+        n = len(self.entries)
+        return cd + _END.pack(0x06054B50, 0, 0, n, n, len(cd), self.cd_offset, 0)
+
+
+def _part(blob, offset, start, end):
+    """The piece of `blob` (which sits at `offset` in the zip) inside start..end."""
+    a, b = max(start - offset, 0), min(end + 1 - offset, len(blob))
+    if a < b:
+        yield blob[a:b]
+
+
+def download_links(photo_ids, expires=12 * 3600):
+    """A direct S3 download link for every file of these photos (sorted), so
+    the browser fetches them straight from S3 - not through this server, so
+    hosting time limits never cut them, and they come from Mumbai directly.
+    Each link saves under the file's own name (what upload matching uses).
+    Links last `expires` seconds (long enough to resume a slow file)."""
+    pids = sorted(set(photo_ids))
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        lists = list(pool.map(photo_files, pids))
+    keys = [o["Key"] for files in lists for o in sorted(files, key=lambda o: o["Key"])]
+    return [{"name": k.rsplit("/", 1)[-1],
+             "url": presigned_get(k, expires=expires, filename=k.rsplit("/", 1)[-1])}
+            for k in keys]
+
+
+def zip_plan(photo_ids):
+    """The ZipPlan for these photos (sorted, so the zip is always the same),
+    or None if it would be too big for a plain zip (4 GB) - then the caller
+    falls back to zip_photos."""
+    pids = sorted(set(photo_ids))
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        lists = list(pool.map(photo_files, pids))
+    objs = [o for files in lists for o in sorted(files, key=lambda o: o["Key"])]
+    plan = ZipPlan(objs)
+    return plan if plan.fits_zip32 else None
 
 
 def folder_photo_ids(brand, date):

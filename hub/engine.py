@@ -16,6 +16,7 @@ from sqlalchemy import select, func, and_, or_, update, delete
 
 from .db import SessionLocal
 from .models import (Worker, Assignment, AssignmentPhoto, QcReview, Notification,
+                     FileCrc,
                      ST_ASSIGNED, ST_DOWNLOADED, ST_UPLOADED, ROLE_WORKER,
                      ROLE_ADMIN, QC_OK, QC_REJECT, QC_RECTIFIED)
 from . import s3source
@@ -305,6 +306,29 @@ def mark_downloaded(assignment_id, photo_ids):
         n = _flip(s, assignment_id, photo_ids, ST_DOWNLOADED)
         s.commit()
         return n
+
+
+class CrcCache:
+    """Remembered CRC-32s of S3 files (table file_crcs), for resumable zip
+    downloads. A checksum only counts while the file's ETag and size match."""
+
+    def get(self, key, etag, size):
+        with SessionLocal() as s:
+            row = s.get(FileCrc, key)
+            if row and row.etag == etag and row.size == size:
+                return row.crc
+            return None
+
+    def put(self, key, etag, size, crc):
+        try:
+            with SessionLocal() as s:
+                s.merge(FileCrc(key=key, etag=etag, size=size, crc=crc))
+                s.commit()
+        except Exception:      # only a cache: a failed save just means a re-read
+            pass
+
+
+crc_cache = CrcCache()
 
 
 def mark_uploaded(assignment_id, photo_ids, drive_links=None):
