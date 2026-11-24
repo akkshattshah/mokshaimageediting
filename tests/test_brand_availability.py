@@ -16,6 +16,7 @@ depends on what is really in the client's bucket - they are not claims that
 the behaviour is right or wrong.
 """
 
+import datetime as dt
 import json
 import os
 import shutil
@@ -44,12 +45,16 @@ class FakeS3:
         self.fail = False
         self.reads = []                   # keys fetched with get_object
         self.breaks = {}                  # key -> reads that break mid-file
+        self.content = {}                 # key -> bytes, when not the default
+
+    def data(self, key):
+        return self.content.get(key) or (f"<{key}>" * 40).encode()
 
     def get_object(self, Bucket, Key):
         if Key not in self.keys:
             raise KeyError(Key)
         self.reads.append(Key)
-        data = (f"<{Key}>" * 40).encode()
+        data = self.data(Key)
         broken = self.breaks.get(Key, 0) > 0
         if broken:
             self.breaks[Key] -= 1
@@ -62,6 +67,11 @@ class FakeS3:
                         raise ConnectionError("simulated frozen S3 read")
 
         return {"Body": _Body()}
+
+    def generate_presigned_url(self, op, Params, ExpiresIn):
+        assert op == "get_object"
+        return (f"https://fake-s3/{Params['Key']}?expires={ExpiresIn}"
+                f"&cd={Params.get('ResponseContentDisposition', '')}")
 
     def list_objects_v2(self, Bucket, Prefix="", Delimiter=None,
                         MaxKeys=1000, ContinuationToken=None, **_):
@@ -84,7 +94,11 @@ class FakeS3:
         out = {"IsTruncated": start + MaxKeys < len(entries)}
         if out["IsTruncated"]:
             out["NextContinuationToken"] = str(start + MaxKeys)
-        contents = [{"Key": v, "Size": 1} for t, v in page if t == "key"]
+        contents = [{"Key": v, "Size": len(self.data(v)),
+                     "ETag": f'"{hash(self.data(v)) & 0xFFFFFFFF:x}"',
+                     "LastModified": dt.datetime(2026, 7, 1, 10, 30, 12,
+                                                 tzinfo=dt.timezone.utc)}
+                    for t, v in page if t == "key"]
         prefixes = [{"Prefix": v} for t, v in page if t == "prefix"]
         if contents:
             out["Contents"] = contents
@@ -116,7 +130,7 @@ sys.modules["boto3"] = _stub
 try:
     from hub import db, engine, s3source               # noqa: E402
     from hub.models import (Worker, Assignment, AssignmentPhoto,   # noqa: E402
-                            ROLE_ADMIN, ST_UPLOADED)
+                            FileCrc, ROLE_ADMIN, ST_UPLOADED)
 finally:
     if _real_boto3 is not None:
         sys.modules["boto3"] = _real_boto3
@@ -141,6 +155,7 @@ def clean_state():
     FAKE_S3.fail = False
     FAKE_S3.reads.clear()
     FAKE_S3.breaks.clear()
+    FAKE_S3.content.clear()
     engine._windows.clear()
     with db.engine.begin() as c:
         for t in reversed(db.Base.metadata.sorted_tables):
@@ -570,7 +585,7 @@ def test_worker_download_streams_and_marks_downloaded_only_at_the_end(web):
     resp = c.get(f"/me/download-zip/{aid}")
     assert resp.status_code == 200 and resp.mimetype == "application/zip"
     assert "b_assignment" in resp.headers["Content-Disposition"]
-    assert "Content-Length" not in resp.headers           # streamed, not prebuilt
+    assert resp.headers["Accept-Ranges"] == "bytes"         # resumable
     assert _statuses(aid) == ["assigned"] * 3              # nothing sent yet
     files = _unzip(resp.get_data())
     assert len(files) == 6
@@ -595,6 +610,152 @@ def test_worker_cannot_download_someone_elses_batch(web):
     other = _worker_client(app, auth, "w2")
     aid = engine.create_assignment("w1", "b", 2)["assignment_id"]
     assert other.get(f"/me/download-zip/{aid}").status_code == 403
+
+
+# ---- resumable worker download -------------------------------------------
+def _batch(app, auth, n=3):
+    put_pairs("b", "20260701", n)
+    FAKE_S3.content[f"{BASE}b/20260701/ext/car-001.psd"] = bytes(range(256)) * 300
+    c = _worker_client(app, auth)
+    aid = engine.create_assignment("w1", "b", n)["assignment_id"]
+    return c, aid
+
+
+def test_download_is_a_valid_zip_with_a_known_size_and_same_every_time(web):
+    app, auth = web
+    c, aid = _batch(app, auth)
+    first = c.get(f"/me/download-zip/{aid}")
+    data = first.get_data()
+    assert first.status_code == 200
+    assert int(first.headers["Content-Length"]) == len(data)
+    files = _unzip(data)                      # testzip: every CRC checks out
+    assert sorted(files) == sorted(f"b/20260701/ext/car-{i:03d}{x}"
+                                   for i in range(3) for x in (".psd", "_orig.jpg"))
+    for name, content in files.items():
+        assert content == FAKE_S3.data(BASE + name)
+    assert c.get(f"/me/download-zip/{aid}").get_data() == data
+
+
+def test_resume_from_any_byte_gives_exactly_the_rest_of_the_zip(web):
+    app, auth = web
+    c, aid = _batch(app, auth)
+    full = c.get(f"/me/download-zip/{aid}")
+    data, etag = full.get_data(), full.headers["ETag"]
+    total = len(data)
+    # inside a header, inside data, a file boundary, the directory, last byte
+    for start in (1, 29, 31, 500, 77_000, total - 200, total - 22, total - 1):
+        r = c.get(f"/me/download-zip/{aid}",
+                  headers={"Range": f"bytes={start}-", "If-Range": etag})
+        assert r.status_code == 206, start
+        assert r.headers["Content-Range"] == f"bytes {start}-{total - 1}/{total}"
+        part = r.get_data()
+        assert int(r.headers["Content-Length"]) == len(part)
+        assert part == data[start:], start
+    r = c.get(f"/me/download-zip/{aid}", headers={"Range": "bytes=10-99"})
+    assert r.status_code == 206 and r.get_data() == data[10:100]
+
+
+def test_resume_reads_only_the_files_still_needed(web):
+    app, auth = web
+    c, aid = _batch(app, auth)
+    data = c.get(f"/me/download-zip/{aid}").get_data()
+    FAKE_S3.reads.clear()
+    r = c.get(f"/me/download-zip/{aid}", headers={"Range": f"bytes={len(data) - 300}-"})
+    assert r.get_data() == data[-300:]
+    assert len(FAKE_S3.reads) <= 1            # earlier files' checksums remembered
+
+
+def test_resume_still_correct_when_checksums_were_not_remembered(web):
+    app, auth = web
+    c, aid = _batch(app, auth)
+    data = c.get(f"/me/download-zip/{aid}").get_data()
+    with db.engine.begin() as conn:
+        conn.execute(FileCrc.__table__.delete())
+    r = c.get(f"/me/download-zip/{aid}", headers={"Range": "bytes=40000-"})
+    assert r.get_data() == data[40000:]
+
+
+def test_resume_of_a_different_zip_starts_over(web):
+    app, auth = web
+    c, aid = _batch(app, auth)
+    r = c.get(f"/me/download-zip/{aid}",
+              headers={"Range": "bytes=100-", "If-Range": '"some-old-zip"'})
+    assert r.status_code == 200 and len(r.get_data()) == int(r.headers["Content-Length"])
+
+
+def test_photos_marked_downloaded_only_once_the_last_byte_is_sent(web):
+    app, auth = web
+    c, aid = _batch(app, auth)
+    total = int(c.head(f"/me/download-zip/{aid}").headers["Content-Length"])
+    c.get(f"/me/download-zip/{aid}", headers={"Range": "bytes=0-999"}).get_data()
+    assert _statuses(aid) == ["assigned"] * 3
+    c.get(f"/me/download-zip/{aid}", headers={"Range": "bytes=1000-"}).get_data()
+    assert _statuses(aid) == ["downloaded"] * 3
+    assert total > 1000
+
+
+def test_a_file_that_changed_in_s3_stops_the_download_instead_of_corrupting(web):
+    app, auth = web
+    c, aid = _batch(app, auth)
+    plan = s3source.zip_plan(engine.assignment_photo_ids(aid))
+    FAKE_S3.content[f"{BASE}b/20260701/ext/car-000.psd"] = b"different size now"
+    with pytest.raises(RuntimeError):
+        b"".join(plan.stream(0, plan.size - 1, engine.crc_cache))
+
+
+def test_byte_range_parsing():
+    from hub.app import _byte_range
+    assert _byte_range("bytes=0-", 100) == (0, 99)
+    assert _byte_range("bytes=10-", 100) == (10, 99)
+    assert _byte_range("bytes=10-20", 100) == (10, 20)
+    assert _byte_range("bytes=10-500", 100) == (10, 99)
+    assert _byte_range("bytes=-30", 100) == (70, 99)
+    assert _byte_range("bytes=100-", 100) is None
+    assert _byte_range("bytes=50-10", 100) is None
+    assert _byte_range("bytes=0-1,5-9", 100) == (0, 99)
+    assert _byte_range("items=0-5", 100) is None
+
+
+def test_range_past_the_end_is_refused(web):
+    app, auth = web
+    c, aid = _batch(app, auth)
+    r = c.get(f"/me/download-zip/{aid}", headers={"Range": "bytes=999999999-"})
+    assert r.status_code == 416
+
+
+# ---- fast download (direct S3 links) --------------------------------------
+def test_fast_download_links_cover_the_same_files_as_the_zip(web):
+    app, auth = web
+    c, aid = _batch(app, auth)
+    zipped = sorted(n.rsplit("/", 1)[-1] for n in _unzip(c.get(f"/me/download-zip/{aid}").get_data()))
+    r = c.get(f"/me/download-links/{aid}")
+    files = r.get_json()["files"]
+    assert sorted(f["name"] for f in files) == zipped
+    for f in files:                           # straight from S3, saved under its own name
+        assert f["url"].startswith("https://fake-s3/" + BASE)
+        assert f'attachment; filename="{f["name"]}"' in f["url"]
+
+
+def test_fast_download_marks_the_photos_downloaded(web):
+    app, auth = web
+    c, aid = _batch(app, auth)
+    c.get(f"/me/download-links/{aid}")
+    assert _statuses(aid) == ["downloaded"] * 3
+
+
+def test_fast_download_only_for_your_own_batch(web):
+    app, auth = web
+    c, aid = _batch(app, auth)
+    other = _worker_client(app, auth, "w2")
+    assert other.get(f"/me/download-links/{aid}").status_code == 403
+    assert _statuses(aid) == ["assigned"] * 3
+
+
+def test_worker_page_shows_both_download_buttons(web):
+    app, auth = web
+    c, aid = _batch(app, auth)
+    page = c.get("/me").get_data(as_text=True)
+    assert f"/me/download-zip/{aid}" in page and f"fastdl({aid}, this)" in page
 
 
 # ---- empty batches and the admin timeline --------------------------------

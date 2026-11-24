@@ -9,7 +9,7 @@
 
 import datetime as dt
 
-from sqlalchemy import String, Integer, ForeignKey, DateTime, Text
+from sqlalchemy import String, Integer, BigInteger, ForeignKey, DateTime, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .db import Base
@@ -144,3 +144,16 @@ class Notification(Base):
         DateTime, default=dt.datetime.utcnow)
 
     recipient: Mapped["Worker"] = relationship(foreign_keys=[recipient_id])
+
+
+class FileCrc(Base):
+    """The CRC-32 checksum of one S3 file, remembered after a download read
+    it, so a resumed zip download can rebuild the exact same zip without
+    reading every earlier file again. Tied to the file's S3 ETag and size:
+    if the file changes, the old checksum is ignored."""
+    __tablename__ = "file_crcs"
+
+    key: Mapped[str] = mapped_column(String(1024), primary_key=True)
+    etag: Mapped[str] = mapped_column(String(200))
+    size: Mapped[int] = mapped_column(BigInteger)
+    crc: Mapped[int] = mapped_column(BigInteger)
